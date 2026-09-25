@@ -28,6 +28,8 @@ var PSR_DEFAULTS = {
     ops: [],                    // selection shapes, see psrSelectShape()
     subject: false,             // keep only what Select > Subject finds inside the shapes
     expectedSize: null,         // [width, height] the shapes were drawn against
+    fit: "exact",               // how to place them on other sizes, see psrShapeTransform()
+    anchor: null,               // fit "anchor": [0..1, 0..1], e.g. [1, 1] = bottom-right corner
     method: "content-aware",    // "content-aware" | "action" | "transparent"
     actionSet: "ps-remover",    // method "action": the recorded Photoshop action to play,
     actionName: "제거",          // e.g. a click on the Contextual Task Bar's Remove button
@@ -39,6 +41,7 @@ var PSR_DEFAULTS = {
 };
 
 var PSR_HISTORY_NAME = "선택 영역 제거 (ps-remover)";
+var PSR_SELECT_HISTORY_NAME = "영역 선택 (ps-remover)";
 var PSR_AREA_CHANNEL = "ps-remover area";
 var PSR_SAVE_FORMATS = { jpg: "jpeg", jpeg: "jpeg", jpe: "jpeg", png: "png", tif: "tiff", tiff: "tiff", psd: "psd" };
 
@@ -96,10 +99,10 @@ function psrActionRemove(cfg, result, job) {
     app.activeDocument = doc;
     result.document = psrDocumentInfo(doc);
 
-    var scale = psrShapeScale(doc, cfg, result);
+    var transform = psrShapeTransform(doc, cfg, result);
     psrPrepareDocument(doc, cfg, result);
     psrAtPixelResolution(doc, function () {
-        psrBuildSelection(doc, psrScaleOps(cfg.ops, scale), cfg.subject, result);
+        psrBuildSelection(doc, psrTransformOps(cfg.ops, transform), cfg.subject, result);
         psrRefineSelection(doc, cfg);
         result.selectionBounds = psrSelectionBounds(doc);
         psrRemoveSelected(doc, cfg, result);
@@ -123,10 +126,22 @@ function psrActionRemove(cfg, result, job) {
     }
 }
 
+// Open the photo, and select the area if there is one - ready for Photoshop's
+// own tools, e.g. the Contextual Task Bar's Remove button.
 function psrActionOpen(cfg, result) {
     var doc = app.open(psrInputFile(cfg));
     app.activeDocument = doc;
     result.document = psrDocumentInfo(doc);
+    if (cfg.ops.length > 0) {
+        var transform = psrShapeTransform(doc, cfg, result);
+        psrInHistory(doc, PSR_SELECT_HISTORY_NAME, function () {
+            psrAtPixelResolution(doc, function () {
+                psrBuildSelection(doc, psrTransformOps(cfg.ops, transform), false, result);
+                psrRefineSelection(doc, cfg);
+                result.selectionBounds = psrSelectionBounds(doc);
+            });
+        });
+    }
     psrBringToFront();
 }
 
@@ -274,16 +289,28 @@ function psrInHistory(doc, name, fn) {
 
 // ---------------------------------------------------------------- selection
 
-// If the photo Photoshop opened is not the size the shapes were drawn on, scale
-// them as long as the aspect ratio matches.
-function psrShapeScale(doc, cfg, result) {
+// Place shapes drawn on a photo of cfg.expectedSize onto this document.
+// Returns [sx, sy, tx, ty] for x -> sx * x + tx, y -> sy * y + ty.
+//   fit "exact":   same aspect ratio only, scaled uniformly
+//   fit "anchor":  keep the distance to cfg.anchor ([0, 0] top-left .. [1, 1]
+//                  bottom-right), scaled by the ratio of the shorter sides
+//   fit "stretch": scale each axis
+// Keep in sync with fit_transform() in shapes.py.
+function psrShapeTransform(doc, cfg, result) {
     var width = psrPx(doc.width);
     var height = psrPx(doc.height);
     var expected = cfg.expectedSize;
     if (!expected || (Math.abs(width - expected[0]) < 0.5 && Math.abs(height - expected[1]) < 0.5)) {
-        return [1, 1];
+        return [1, 1, 0, 0];
     }
-    var ratio = (width / height) / (expected[0] / expected[1]);
+    var w = expected[0], h = expected[1];
+    if (cfg.fit == "stretch") return [width / w, height / h, 0, 0];
+    if (cfg.fit == "anchor") {
+        var anchor = cfg.anchor || [0.5, 0.5];
+        var s = Math.min(width, height) / Math.min(w, h);
+        return [s, s, anchor[0] * (width - s * w), anchor[1] * (height - s * h)];
+    }
+    var ratio = (width / height) / (w / h);
     if (Math.abs(ratio - 1) > 0.01) {
         var rotated = Math.abs(width - expected[1]) < 0.5 && Math.abs(height - expected[0]) < 0.5;
         throw psrError("Photoshop에서 연 사진 크기(" + width + "x" + height + ")가 영역을 선택한 사진 크기(" +
@@ -291,26 +318,27 @@ function psrShapeScale(doc, cfg, result) {
             (rotated ? " 사진의 회전(EXIF 방향) 정보가 다르게 적용된 것 같습니다." : ""));
     }
     result.warnings.push("Photoshop에서 연 사진 크기(" + width + "x" + height + ")에 맞게 선택 영역 좌표를 조정했습니다.");
-    return [width / expected[0], height / expected[1]];
+    return [width / w, height / h, 0, 0];
 }
 
-function psrScaleOps(ops, scale) {
-    var sx = scale[0], sy = scale[1];
-    if (sx == 1 && sy == 1) return ops;
-    var scaled = [];
+function psrTransformOps(ops, t) {
+    if (t[0] == 1 && t[1] == 1 && t[2] == 0 && t[3] == 0) return ops;
+    var mapped = [];
     for (var i = 0; i < ops.length; i++) {
         var op = ops[i];
         var copy = { op: op.op, mode: op.mode };
-        if (op.box) copy.box = [op.box[0] * sx, op.box[1] * sy, op.box[2] * sx, op.box[3] * sy];
+        if (op.box) {
+            copy.box = [op.box[0] * t[0] + t[2], op.box[1] * t[1] + t[3], op.box[2] * t[0] + t[2], op.box[3] * t[1] + t[3]];
+        }
         if (op.points) {
             copy.points = [];
             for (var j = 0; j < op.points.length; j++) {
-                copy.points.push([op.points[j][0] * sx, op.points[j][1] * sy]);
+                copy.points.push([op.points[j][0] * t[0] + t[2], op.points[j][1] * t[1] + t[3]]);
             }
         }
-        scaled.push(copy);
+        mapped.push(copy);
     }
-    return scaled;
+    return mapped;
 }
 
 function psrBuildSelection(doc, ops, useSubject, result) {
@@ -715,7 +743,7 @@ function psrAlertResult(result) {
         message = "작업을 끝내지 못했습니다.\n" + result.error;
         if (result.leftOpen) message += "\n\n작업하던 사진은 Photoshop에 열어 두었습니다.";
     } else if (result.action == "open") {
-        message = "사진을 열었습니다.";
+        message = result.selectionBounds ? "사진을 열고 영역을 선택했습니다." : "사진을 열었습니다.";
     } else if (result.action == "find_action") {
         message = result.recordedAction.found
             ? "동작을 찾았습니다. 녹화된 단계: " + result.recordedAction.steps.join(", ")

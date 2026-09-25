@@ -19,7 +19,15 @@ Box = Tuple[float, float, float, float]
 
 KINDS = ("rect", "ellipse", "polygon", "brush")
 MODES = ("add", "subtract")
+FITS = ("exact", "anchor", "stretch")
 SELECTION_FILE_VERSION = 1
+
+# Anchor points for fit "anchor": (0, 0) is the top-left corner, (1, 1) the bottom-right.
+ANCHOR_LABELS = {
+    (0.0, 0.0): "왼쪽 위", (0.5, 0.0): "위 가운데", (1.0, 0.0): "오른쪽 위",
+    (0.0, 0.5): "왼쪽 가운데", (0.5, 0.5): "가운데", (1.0, 0.5): "오른쪽 가운데",
+    (0.0, 1.0): "왼쪽 아래", (0.5, 1.0): "아래 가운데", (1.0, 1.0): "오른쪽 아래",
+}
 
 
 class SelectionError(ValueError):
@@ -72,9 +80,9 @@ class Shape:
         r = self.radius if self.kind == "brush" else 0.0
         return (min(xs) - r, min(ys) - r, max(xs) + r, max(ys) + r)
 
-    def scaled(self, sx: float, sy: float) -> "Shape":
-        """The same shape on a photo resized by ``sx`` and ``sy``."""
-        points = [(x * sx, y * sy) for x, y in self.points]
+    def transformed(self, sx: float, sy: float, tx: float = 0.0, ty: float = 0.0) -> "Shape":
+        """The shape moved by ``x -> sx * x + tx``, ``y -> sy * y + ty``."""
+        points = [(x * sx + tx, y * sy + ty) for x, y in self.points]
         return Shape(self.kind, points, self.mode, self.radius * (sx + sy) / 2)
 
     def to_ops(self) -> List[dict]:
@@ -171,34 +179,145 @@ def parse_points(text: str) -> List[Point]:
     return points
 
 
-# ---------------------------------------------------------- selection files
+# -------------------------------------------------------------------- areas
 
 
-def save_selection(path, shapes: Sequence[Shape], image_size: Optional[Tuple[int, int]] = None) -> None:
-    data = {
-        "version": SELECTION_FILE_VERSION,
-        "image_size": list(image_size) if image_size else None,
-        "shapes": [shape.to_dict() for shape in shapes],
-    }
-    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+@dataclass
+class Area:
+    """A reusable selection: shapes plus how to place them on photos of other sizes.
+
+    ``image_size`` is the size of the photo the shapes were drawn on.
+
+    fit "exact":   the same size, or the same aspect ratio scaled uniformly; other
+                   photos are refused.
+    fit "anchor":  keep the shapes' distance to ``anchor`` ((0, 0) top-left,
+                   (1, 1) bottom-right, (0.5, 0.5) centre), scaled by the ratio of
+                   the shorter sides. A watermark in the bottom-right corner stays
+                   there on a portrait photo too.
+    fit "stretch": scale each axis to the photo's size.
+    """
+
+    shapes: List[Shape]
+    image_size: Optional[Tuple[int, int]] = None
+    fit: str = "exact"
+    anchor: Optional[Tuple[float, float]] = None
+
+    def __post_init__(self) -> None:
+        self.shapes = list(self.shapes)
+        if self.fit not in FITS:
+            raise SelectionError(f"맞추는 방법은 {', '.join(FITS)} 중 하나여야 합니다: {self.fit!r}")
+        if self.image_size is not None:
+            width, height = (int(_number(v)) for v in self.image_size)
+            if width <= 0 or height <= 0:
+                raise SelectionError("사진 크기는 0보다 커야 합니다.")
+            self.image_size = (width, height)
+        elif self.fit != "exact":
+            raise SelectionError("다른 크기의 사진에 맞추려면 영역을 그린 사진의 크기가 필요합니다.")
+        if self.fit == "anchor" and self.anchor is None:
+            self.anchor = auto_anchor(self.shapes, self.image_size)
+        if self.anchor is not None:
+            ax, ay = (_number(v) for v in self.anchor)
+            if not (0 <= ax <= 1 and 0 <= ay <= 1):
+                raise SelectionError("anchor 값은 0~1 사이여야 합니다.")
+            self.anchor = (ax, ay)
+
+    def on_photo(self, size: Tuple[int, int]) -> List[Shape]:
+        """The shapes placed on a photo of ``size`` (width, height)."""
+        if not self.image_size:
+            return list(self.shapes)
+        sx, sy, tx, ty = fit_transform(self.image_size, size, self.fit, self.anchor)
+        return [shape.transformed(sx, sy, tx, ty) for shape in self.shapes]
+
+    def describe(self) -> str:
+        """How the area adapts to other photos, in words."""
+        if self.fit == "anchor":
+            return f"{ANCHOR_LABELS.get(self.anchor, '기준점')} 기준으로 맞춤"
+        if self.fit == "stretch":
+            return "사진 크기에 비례해서 늘림"
+        return "같은 비율의 사진에만"
+
+    def to_dict(self) -> dict:
+        data: dict = {
+            "version": SELECTION_FILE_VERSION,
+            "image_size": list(self.image_size) if self.image_size else None,
+            "fit": self.fit,
+        }
+        if self.anchor is not None:
+            data["anchor"] = [self.anchor[0], self.anchor[1]]
+        data["shapes"] = [shape.to_dict() for shape in self.shapes]
+        return data
+
+    @classmethod
+    def from_dict(cls, data) -> "Area":
+        if isinstance(data, list):  # a bare list of shapes
+            data = {"shapes": data}
+        if not isinstance(data, dict) or not isinstance(data.get("shapes"), list):
+            raise SelectionError("선택 영역 파일 형식이 올바르지 않습니다.")
+        size = data.get("image_size")
+        if size is not None and (not isinstance(size, (list, tuple)) or len(size) != 2):
+            raise SelectionError("image_size는 [너비, 높이] 형식이어야 합니다.")
+        anchor = data.get("anchor")
+        if anchor is not None and (not isinstance(anchor, (list, tuple)) or len(anchor) != 2):
+            raise SelectionError("anchor는 [x, y] 형식이어야 합니다.")
+        return cls(
+            [Shape.from_dict(item) for item in data["shapes"]],
+            tuple(size) if size is not None else None,
+            data.get("fit", "exact"),
+            tuple(anchor) if anchor is not None else None,
+        )
 
 
-def load_selection(path) -> Tuple[List[Shape], Optional[Tuple[int, int]]]:
+def save_area(path, area: Area) -> None:
+    Path(path).write_text(json.dumps(area.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def load_area(path) -> Area:
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise SelectionError(f"선택 영역 파일을 읽을 수 없습니다: {path} ({exc})") from exc
-    if isinstance(data, list):  # a bare list of shapes
-        data = {"shapes": data}
-    if not isinstance(data, dict) or not isinstance(data.get("shapes"), list):
-        raise SelectionError(f"선택 영역 파일 형식이 올바르지 않습니다: {path}")
-    shapes = [Shape.from_dict(item) for item in data["shapes"]]
-    size = data.get("image_size")
-    if size is not None:
-        if not isinstance(size, (list, tuple)) or len(size) != 2:
-            raise SelectionError("image_size는 [너비, 높이] 형식이어야 합니다.")
-        size = (int(_number(size[0])), int(_number(size[1])))
-    return shapes, size
+    try:
+        return Area.from_dict(data)
+    except SelectionError as exc:
+        raise SelectionError(f"{path}: {exc}") from None
+
+
+def fit_transform(from_size: Tuple[float, float], to_size: Tuple[float, float], fit: str = "exact",
+                  anchor: Optional[Tuple[float, float]] = None) -> Tuple[float, float, float, float]:
+    """``(sx, sy, tx, ty)`` placing shapes drawn at ``from_size`` onto ``to_size``.
+
+    Keep in sync with psrShapeTransform() in jsx/ps_remover.jsx, which does
+    the same with the size Photoshop actually opened.
+    """
+    w, h = from_size
+    width, height = to_size
+    if abs(width - w) < 0.5 and abs(height - h) < 0.5:
+        return (1.0, 1.0, 0.0, 0.0)
+    if fit == "stretch":
+        return (width / w, height / h, 0.0, 0.0)
+    if fit == "anchor":
+        ax, ay = anchor if anchor is not None else (0.5, 0.5)
+        s = min(width, height) / min(w, h)
+        return (s, s, ax * (width - s * w), ay * (height - s * h))
+    if abs((width / height) / (w / h) - 1) > 0.01:
+        raise SelectionError(f"사진 크기({width:g}x{height:g})의 가로세로 비율이 영역을 그린 사진"
+                             f"({w:g}x{h:g})과 다릅니다. 공통 영역의 맞추는 방법을 바꿔 보세요.")
+    return (width / w, height / h, 0.0, 0.0)
+
+
+def auto_anchor(shapes: Sequence[Shape], size: Tuple[int, int]) -> Tuple[float, float]:
+    """The corner, edge middle or centre the shapes are nearest to, e.g. (1.0, 1.0) for bottom-right."""
+    added = [shape for shape in shapes if shape.mode == "add"] or list(shapes)
+    if not added:
+        return (0.5, 0.5)
+    boxes = [shape.box for shape in added]
+    cx = (min(b[0] for b in boxes) + max(b[2] for b in boxes)) / 2 / size[0]
+    cy = (min(b[1] for b in boxes) + max(b[3] for b in boxes)) / 2 / size[1]
+    return (_third(cx), _third(cy))
+
+
+def _third(value: float) -> float:
+    return 0.0 if value < 1 / 3 else 0.5 if value <= 2 / 3 else 1.0
 
 
 # ----------------------------------------------------------------- geometry

@@ -7,6 +7,8 @@ from unittest import mock
 
 from ps_remover import api, shapes
 
+BOX = shapes.Area([shapes.rect(0, 0, 5, 5)])
+
 
 class DefaultOutputPathTests(unittest.TestCase):
     def setUp(self):
@@ -39,12 +41,13 @@ class DefaultOutputPathTests(unittest.TestCase):
 class ConfigTests(unittest.TestCase):
     def test_remove_config(self):
         options = api.RemoveOptions(method="transparent", expand=7, feather=1.5, subject=True, keep_open=False)
-        config = api.build_remove_config("in.jpg", "out.png", [shapes.rect(0, 0, 10, 10)], options, (640, 480))
+        config = api.build_remove_config("in.jpg", "out.png", shapes.Area([shapes.rect(0, 0, 10, 10)], (640, 480)), options)
         self.assertEqual(config["action"], "remove")
         self.assertTrue(os.path.isabs(config["input"]))
         self.assertTrue(config["output"].endswith("out.png"))
         self.assertEqual(config["ops"], [{"op": "rect", "mode": "add", "box": [0, 0, 10, 10]}])
         self.assertEqual(config["expectedSize"], [640, 480])
+        self.assertEqual((config["fit"], config["anchor"]), ("exact", None))
         self.assertEqual(
             {k: config[k] for k in ("method", "expand", "feather", "subject", "keepOpen", "report")},
             {"method": "transparent", "expand": 7, "feather": 1.5, "subject": True, "keepOpen": False, "report": "return"},
@@ -52,7 +55,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_action_method_config(self):
         options = api.RemoveOptions(method="action", action_set="내 동작", action_name="지우기")
-        config = api.build_remove_config("in.jpg", "out.jpg", [shapes.rect(0, 0, 10, 10)], options)
+        config = api.build_remove_config("in.jpg", "out.jpg", shapes.Area([shapes.rect(0, 0, 10, 10)]), options)
         self.assertEqual((config["method"], config["actionSet"], config["actionName"]), ("action", "내 동작", "지우기"))
         current = api.build_remove_current_config(options)
         self.assertEqual((current["actionSet"], current["actionName"]), ("내 동작", "지우기"))
@@ -68,11 +71,12 @@ class ConfigTests(unittest.TestCase):
 
     def test_remove_config_needs_an_area(self):
         with self.assertRaises(api.JobError):
-            api.build_remove_config("in.jpg", "out.jpg", [], api.RemoveOptions())
+            api.build_remove_config("in.jpg", "out.jpg", shapes.Area([]), api.RemoveOptions())
         with self.assertRaises(api.JobError):
-            api.build_remove_config("in.jpg", "out.jpg", [shapes.rect(0, 0, 5, 5, mode="subtract")], api.RemoveOptions())
+            api.build_remove_config("in.jpg", "out.jpg", shapes.Area([shapes.rect(0, 0, 5, 5, mode="subtract")]),
+                                    api.RemoveOptions())
         # Select Subject alone is enough.
-        api.build_remove_config("in.jpg", "out.jpg", [], api.RemoveOptions(subject=True))
+        api.build_remove_config("in.jpg", "out.jpg", shapes.Area([]), api.RemoveOptions(subject=True))
 
     def test_invalid_options(self):
         for options in (
@@ -83,11 +87,11 @@ class ConfigTests(unittest.TestCase):
             api.RemoveOptions(jpeg_quality=13),
         ):
             with self.subTest(options=options), self.assertRaises(api.JobError):
-                api.build_remove_config("in.jpg", "out.jpg", [shapes.rect(0, 0, 5, 5)], options)
+                api.build_remove_config("in.jpg", "out.jpg", BOX, options)
 
     def test_output_format_must_be_saveable(self):
         with self.assertRaises(api.JobError):
-            api.build_remove_config("in.jpg", "out.gif", [shapes.rect(0, 0, 5, 5)])
+            api.build_remove_config("in.jpg", "out.gif", BOX)
         with self.assertRaises(api.JobError):
             api.build_remove_current_config(output="out.bmp")
 
@@ -109,26 +113,26 @@ class RemoveAreaTests(unittest.TestCase):
 
     def test_runs_script_with_default_output(self):
         with mock.patch.object(api, "run_jsx", return_value={"ok": True}) as run:
-            api.remove_area(self.photo, [shapes.rect(0, 0, 5, 5)], photoshop="Adobe Photoshop 2025", timeout=30)
+            api.remove_area(self.photo, BOX, photoshop="Adobe Photoshop 2025", timeout=30)
         source = run.call_args.args[0]
         self.assertIn("photo_removed.jpg", source)
         self.assertEqual(run.call_args.kwargs, {"photoshop": "Adobe Photoshop 2025", "timeout": 30})
 
     def test_missing_photo(self):
         with self.assertRaises(api.JobError):
-            api.remove_area(self.photo.with_name("nope.jpg"), [shapes.rect(0, 0, 5, 5)])
+            api.remove_area(self.photo.with_name("nope.jpg"), BOX)
 
     def test_refuses_to_overwrite_without_permission(self):
         existing = self.photo.with_name("done.jpg")
         existing.write_bytes(b"x")
         with mock.patch.object(api, "run_jsx") as run:
             with self.assertRaises(api.JobError):
-                api.remove_area(self.photo, [shapes.rect(0, 0, 5, 5)], output=existing)
+                api.remove_area(self.photo, BOX, output=existing)
             with self.assertRaisesRegex(api.JobError, "원본"):
-                api.remove_area(self.photo, [shapes.rect(0, 0, 5, 5)], output=self.photo)
+                api.remove_area(self.photo, BOX, output=self.photo)
             run.assert_not_called()
             run.return_value = {"ok": True}
-            api.remove_area(self.photo, [shapes.rect(0, 0, 5, 5)], output=self.photo, overwrite=True)
+            api.remove_area(self.photo, BOX, output=self.photo, overwrite=True)
             run.assert_called_once()
 
     def test_open_photo(self):
@@ -144,7 +148,7 @@ class RemoveAreaTests(unittest.TestCase):
         self.assertIn('"actionName":"\\uc81c\\uac70"', run.call_args.args[0])  # "제거", escaped
 
     def test_export_script(self):
-        config = api.build_remove_config(self.photo, self.photo.with_name("o.jpg"), [shapes.rect(0, 0, 5, 5)])
+        config = api.build_remove_config(self.photo, self.photo.with_name("o.jpg"), BOX)
         path = api.export_script(Path(self.tmp.name) / "job", config)
         self.assertEqual(path.suffix, ".jsx")
         source = path.read_text(encoding="ascii")

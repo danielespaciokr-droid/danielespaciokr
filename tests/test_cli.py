@@ -2,12 +2,14 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
+import time
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from ps_remover import cli, shapes
+from ps_remover import cli, settings, shapes
 from ps_remover.photoshop import PhotoshopNotFound, ScriptFailed
 
 
@@ -24,6 +26,9 @@ class CliTests(unittest.TestCase):
         self.dir = Path(self.tmp.name)
         self.photo = self.dir / "photo.jpg"
         self.photo.write_bytes(b"jpeg")
+        home = mock.patch.dict(os.environ, {"PS_REMOVER_HOME": str(self.dir / "home")})
+        home.start()
+        self.addCleanup(home.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -37,10 +42,11 @@ class CliTests(unittest.TestCase):
             ])
         self.assertEqual(code, 0, err)
         args, kwargs = remove.call_args
-        photo, shape_list, output, options = args
+        photo, area, output, options = args
         self.assertEqual(photo, self.photo)
-        self.assertEqual([s.kind for s in shape_list], ["rect", "ellipse", "polygon"])
-        self.assertEqual(shape_list[0].box, (100, 50, 300, 250))
+        self.assertEqual([s.kind for s in area.shapes], ["rect", "ellipse", "polygon"])
+        self.assertEqual(area.shapes[0].box, (100, 50, 300, 250))
+        self.assertIsNone(area.image_size)
         self.assertEqual(output, self.dir / "photo_removed.png")  # transparent -> png
         self.assertEqual((options.method, options.expand, options.feather, options.keep_open),
                          ("transparent", 8, 1.0, True))
@@ -84,7 +90,7 @@ class CliTests(unittest.TestCase):
 
     def test_selection_file_and_batch(self):
         selection = self.dir / "sel.json"
-        shapes.save_selection(selection, [shapes.rect(0, 0, 10, 10)], (640, 480))
+        shapes.save_area(selection, shapes.Area([shapes.rect(0, 0, 10, 10)], (640, 480)))
         second = self.dir / "second.png"
         second.write_bytes(b"png")
         with mock.patch("ps_remover.api.remove_area", return_value={"ok": True, "output": "o"}) as remove:
@@ -93,7 +99,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(remove.call_count, 2)
         first_call = remove.call_args_list[0]
-        self.assertEqual(first_call.kwargs["image_size"], (640, 480))
+        self.assertEqual(first_call.args[1].image_size, (640, 480))
         self.assertFalse(first_call.args[3].keep_open)  # several photos: do not leave them all open
         self.assertEqual(remove.call_args_list[1].args[2], self.dir / "out" / "second_removed.png")
         lines = [json.loads(line) for line in out.splitlines()]
@@ -172,6 +178,83 @@ class CliTests(unittest.TestCase):
         self.assertEqual(options.expand, 0)
         self.assertEqual(output, "saved.png")
         self.assertIn("saved.png", out)
+
+    def test_presets_command(self):
+        code, out, _ = run(["presets"])
+        self.assertEqual(code, 0)
+        self.assertIn("저장된 공통 영역이 없습니다", out)
+        settings.save_preset("워터마크", shapes.Area([shapes.rect(3500, 2800, 3980, 2980)], (4000, 3000), "anchor"))
+        code, out, _ = run(["presets"])
+        self.assertIn("- 워터마크: 도형 1개, 4000x3000 사진 기준, 오른쪽 아래 기준으로 맞춤", out)
+        code, out, _ = run(["presets", "--json"])
+        self.assertEqual(json.loads(out)[0]["name"], "워터마크")
+        code, _, err = run(["presets", "--delete", "없는이름"])
+        self.assertEqual(code, 1)
+        self.assertIn("워터마크", err)  # lists what exists
+        code, out, _ = run(["presets", "--delete", "워터마크"])
+        self.assertEqual((code, settings.list_presets()), (0, []))
+
+    def test_remove_and_open_with_preset(self):
+        area = shapes.Area([shapes.rect(3500, 2800, 3980, 2980)], (4000, 3000), "anchor")
+        settings.save_preset("워터마크", area)
+        with mock.patch("ps_remover.api.remove_area", return_value={"ok": True, "output": "o"}) as remove:
+            code, _, err = run(["remove", str(self.photo), "--preset", "워터마크"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(remove.call_args.args[1], area)
+        with mock.patch("ps_remover.api.open_photo", return_value={"ok": True, "selectionBounds": [1, 2, 3, 4]}) as open_:
+            code, out, _ = run(["open", str(self.photo), "--preset", "워터마크", "--expand", "0"])
+        self.assertEqual(code, 0)
+        photo, opened_area, options = open_.call_args.args
+        self.assertEqual((opened_area, options.expand), (area, 0))
+        self.assertIn("선택해 두었습니다", out)
+        with mock.patch("ps_remover.api.open_photo", return_value={"ok": True}) as open_:
+            run(["open", str(self.photo)])
+        self.assertIsNone(open_.call_args.args[1])  # nothing to select
+        code, _, err = run(["remove", str(self.photo), "--preset", "워터마크", "--rect", "0,0,5,5"])
+        self.assertEqual(code, 1)
+        self.assertIn("더할 수는 없습니다", err)
+        code, _, err = run(["remove", str(self.photo), "--preset", "없음"])
+        self.assertEqual(code, 1)
+
+    def test_batch_command(self):
+        folder = self.dir / "사진"
+        folder.mkdir()
+        for name in ("a.jpg", "b.jpg"):
+            path = folder / name
+            path.write_bytes(b"jpeg")
+            stamp = time.time() - 60
+            os.utime(path, (stamp, stamp))
+        settings.save_preset("워터마크", shapes.Area([shapes.rect(0, 0, 10, 10)], (100, 100), "anchor"))
+
+        def fake_remove(photo, area, output, options, **kwargs):
+            output.write_bytes(b"result")
+            return {"ok": True, "output": str(output), "warnings": []}
+
+        with mock.patch("ps_remover.api.remove_area", side_effect=fake_remove) as remove:
+            code, out, err = run(["batch", str(folder), "--preset", "워터마크", "--method", "action"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("[2/2] b.jpg", out)
+            self.assertIn("끝났습니다: 2장 완료, 0장 실패", out)
+            self.assertEqual(remove.call_args.args[3].method, "action")
+            self.assertTrue((folder / "지운 사진" / "b_removed.jpg").exists())
+            code, out, _ = run(["batch", str(folder), "--preset", "워터마크"])
+            self.assertIn("새로 지울 사진이 없습니다", out)
+            code, out, _ = run(["batch", str(folder), "--preset", "워터마크", "--reprocess", "--json"])
+            events = [json.loads(line) for line in out.splitlines()]
+            self.assertEqual([e["type"] for e in events].count("done"), 2)
+            self.assertEqual(events[-1]["type"], "finished")
+
+    def test_batch_errors(self):
+        code, _, err = run(["batch", str(self.dir / "없는폴더"), "--rect", "0,0,5,5"])
+        self.assertEqual(code, 1)
+        self.assertIn("사진 폴더를 찾을 수 없습니다", err)
+        stamp = time.time() - 60
+        os.utime(self.photo, (stamp, stamp))
+        with mock.patch("ps_remover.api.remove_area", side_effect=PhotoshopNotFound("Photoshop 없음")):
+            code, out, err = run(["batch", str(self.dir), "--rect", "0,0,5,5"])
+        self.assertEqual(code, 1)
+        self.assertIn("Photoshop 없음", err)
+        self.assertIn("멈췄습니다: 0장 완료, 0장 실패", out)
 
     @unittest.skipUnless(importlib.util.find_spec("tkinter"), "tkinter is not installed")
     def test_no_arguments_start_the_gui(self):

@@ -122,27 +122,82 @@ class ParsingTests(unittest.TestCase):
             shapes.parse_points("10,10 50,10")
 
 
-class SelectionFileTests(unittest.TestCase):
+class AreaTests(unittest.TestCase):
+    WATERMARK = [shapes.rect(3500, 2800, 3980, 2980)]  # bottom-right corner of a 4000x3000 photo
+
     def test_save_and_load(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "선택.json"
-            shapes.save_selection(path, [shapes.rect(1, 2, 3, 4), shapes.brush([(5, 5)], 2)], (640, 480))
-            loaded, size = shapes.load_selection(path)
-        self.assertEqual(size, (640, 480))
-        self.assertEqual([s.kind for s in loaded], ["rect", "brush"])
+            area = shapes.Area([shapes.rect(1, 2, 3, 4), shapes.brush([(5, 5)], 2)], (640, 480), "anchor", (1, 0.5))
+            shapes.save_area(path, area)
+            loaded = shapes.load_area(path)
+        self.assertEqual(loaded, area)
+        self.assertEqual([s.kind for s in loaded.shapes], ["rect", "brush"])
 
-    def test_load_bare_list_and_errors(self):
+    def test_old_files_and_bare_lists_load(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "s.json"
+            path.write_text('{"version": 1, "image_size": [640, 480], "shapes": [{"type": "rect", "box": [0, 0, 10, 10]}]}',
+                            encoding="utf-8")
+            area = shapes.load_area(path)
+            self.assertEqual((area.image_size, area.fit, area.anchor), ((640, 480), "exact", None))
             path.write_text('[{"type": "rect", "box": [0, 0, 10, 10]}]', encoding="utf-8")
-            loaded, size = shapes.load_selection(path)
-            self.assertEqual(len(loaded), 1)
-            self.assertIsNone(size)
-            path.write_text("{not json", encoding="utf-8")
+            area = shapes.load_area(path)
+            self.assertEqual((len(area.shapes), area.image_size), (1, None))
+            for text in ("{not json", '{"shapes": 3}', '{"shapes": [], "fit": "zoom"}', '{"shapes": [], "anchor": [1]}'):
+                path.write_text(text, encoding="utf-8")
+                with self.subTest(text=text), self.assertRaises(SelectionError):
+                    shapes.load_area(path)
             with self.assertRaises(SelectionError):
-                shapes.load_selection(path)
-            with self.assertRaises(SelectionError):
-                shapes.load_selection(Path(tmp) / "missing.json")
+                shapes.load_area(Path(tmp) / "missing.json")
+
+    def test_validation(self):
+        with self.assertRaises(SelectionError):
+            shapes.Area(self.WATERMARK, None, "anchor")  # fitting needs the reference size
+        with self.assertRaises(SelectionError):
+            shapes.Area(self.WATERMARK, (4000, 3000), "anchor", (2, 0))
+        with self.assertRaises(SelectionError):
+            shapes.Area(self.WATERMARK, (0, 3000))
+
+    def test_auto_anchor(self):
+        size = (900, 900)
+        cases = [((10, 10, 100, 100), (0.0, 0.0)), ((400, 10, 500, 60), (0.5, 0.0)), ((800, 800, 890, 890), (1.0, 1.0)),
+                 ((400, 400, 500, 500), (0.5, 0.5)), ((10, 850, 60, 890), (0.0, 1.0))]
+        for box, anchor in cases:
+            with self.subTest(box=box):
+                self.assertEqual(shapes.auto_anchor([shapes.rect(*box)], size), anchor)
+        # Subtracted shapes do not count; an empty selection anchors to the centre.
+        mixed = [shapes.rect(800, 800, 890, 890), shapes.rect(0, 0, 50, 50, mode="subtract")]
+        self.assertEqual(shapes.auto_anchor(mixed, size), (1.0, 1.0))
+        self.assertEqual(shapes.auto_anchor([], size), (0.5, 0.5))
+        self.assertEqual(shapes.Area(self.WATERMARK, (4000, 3000), "anchor").anchor, (1.0, 1.0))
+
+    def test_fit_anchor_keeps_the_corner(self):
+        area = shapes.Area(self.WATERMARK, (4000, 3000), "anchor")
+        self.assertEqual(area.on_photo((4000, 3000))[0].box, (3500, 2800, 3980, 2980))
+        self.assertEqual(area.on_photo((3000, 4000))[0].box, (2500, 3800, 2980, 3980))  # portrait
+        self.assertEqual(area.on_photo((2000, 1500))[0].box, (1750, 1400, 1990, 1490))  # half size
+        centre = shapes.Area([shapes.ellipse(1900, 1400, 2100, 1600)], (4000, 3000), "anchor")
+        self.assertEqual(centre.anchor, (0.5, 0.5))
+        self.assertEqual(centre.on_photo((3000, 4000))[0].box, (1400, 1900, 1600, 2100))
+
+    def test_fit_stretch_and_exact(self):
+        stretch = shapes.Area(self.WATERMARK, (4000, 3000), "stretch")
+        self.assertEqual(stretch.on_photo((2000, 3000))[0].box, (1750, 2800, 1990, 2980))
+        exact = shapes.Area(self.WATERMARK, (4000, 3000))
+        self.assertEqual(exact.on_photo((2000, 1500))[0].box, (1750, 1400, 1990, 1490))
+        with self.assertRaises(SelectionError):
+            exact.on_photo((3000, 4000))
+        # Without a reference size the shapes stay where they are.
+        self.assertEqual(shapes.Area(self.WATERMARK).on_photo((100, 100))[0].box, (3500, 2800, 3980, 2980))
+
+    def test_transformed_brush_radius(self):
+        moved = shapes.brush([(10, 10)], 4).transformed(2, 2, 5, 0)
+        self.assertEqual((moved.points, moved.radius), ([(25.0, 20.0)], 8.0))
+
+    def test_describe(self):
+        self.assertIn("오른쪽 아래", shapes.Area(self.WATERMARK, (4000, 3000), "anchor").describe())
+        self.assertIn("비례", shapes.Area(self.WATERMARK, (4000, 3000), "stretch").describe())
 
 
 @unittest.skipIf(PIL is None, "Pillow is not installed")

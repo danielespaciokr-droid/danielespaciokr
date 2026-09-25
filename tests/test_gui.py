@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover - tkinter or Pillow missing
     gui = None
 
-from ps_remover import shapes
+from ps_remover import settings, shapes
 
 
 @unittest.skipIf(gui is None, "tkinter or Pillow is not installed")
@@ -92,6 +93,9 @@ def _display_available():
 class AppTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        home = mock.patch.dict(os.environ, {"PS_REMOVER_HOME": os.path.join(self.tmp.name, "home")})
+        home.start()
+        self.addCleanup(home.stop)
         self.photo = Path(self.tmp.name) / "photo.jpg"
         Image.new("RGB", (800, 600), (40, 120, 200)).save(self.photo)
         self.root = tk.Tk()
@@ -159,9 +163,9 @@ class AppTests(unittest.TestCase):
                     break
         args, kwargs = remove.call_args
         self.assertEqual(args[0], self.photo)
-        self.assertEqual(len(args[1]), 1)
+        self.assertEqual((len(args[1].shapes), args[1].image_size, args[1].fit), (1, (800, 600), "exact"))
         self.assertEqual(args[2], self.photo.with_name("photo_removed.jpg"))
-        self.assertEqual(kwargs, {"image_size": (800, 600), "overwrite": False})
+        self.assertEqual(kwargs, {"overwrite": False})
         self.assertIn("완료", self.app.status.get())
 
     def test_action_method_and_settings_dialog(self):
@@ -195,6 +199,138 @@ class AppTests(unittest.TestCase):
             self.wait_idle()
         self.assertIn("세트가 없습니다", app.action_status.get())
 
+    def test_save_and_apply_common_area(self):
+        app = self.app
+        self.drag((650, 500), (790, 590))  # bottom-right corner
+        dialog = app.save_preset()
+        self.pump(0.05)
+        self.assertEqual(dialog.anchor.get(), "오른쪽 아래")  # detected from where the shapes are
+        dialog.name.set("워터마크")
+        dialog.save()
+        self.assertEqual(settings.list_presets(), ["워터마크"])
+        self.assertEqual(app.preset.get(), "워터마크")
+        area = settings.load_preset("워터마크")
+        self.assertEqual((area.image_size, area.fit, area.anchor), ((800, 600), "anchor", (1.0, 1.0)))
+        box = app.shapes[0].box
+
+        # On a portrait photo the area lands in the same corner.
+        portrait = Path(self.tmp.name) / "portrait.jpg"
+        Image.new("RGB", (600, 800)).save(portrait)
+        app.load_photo(portrait)
+        self.assertEqual(app.shapes, [])
+        app.apply_preset()
+        left, top, right, bottom = app.shapes[0].box
+        self.assertAlmostEqual(right, 600 - (800 - box[2]), delta=0.01)
+        self.assertAlmostEqual(bottom, 800 - (600 - box[3]), delta=0.01)
+        self.assertIn("워터마크", app.status.get())
+
+        with mock.patch.object(gui.messagebox, "askyesno", return_value=True):
+            app.delete_preset()
+        self.assertEqual((settings.list_presets(), app.preset.get()), ([], ""))
+
+    def test_saving_needs_a_drawn_area(self):
+        with mock.patch.object(gui.messagebox, "showinfo") as showinfo:
+            self.assertIsNone(self.app.save_preset())
+        showinfo.assert_called_once()
+
+    def test_open_selects_the_drawn_area(self):
+        with mock.patch.object(gui.api, "open_photo", return_value={"ok": True}) as open_photo:
+            self.app.run_open()
+            self.wait_idle()
+        self.assertIsNone(open_photo.call_args.args[1])  # nothing drawn: just open
+        self.drag((100, 100), (300, 200))
+        with mock.patch.object(gui.api, "open_photo", return_value={"ok": True, "selectionBounds": [1, 2, 3, 4]}) as open_photo:
+            self.app.run_open()
+            self.wait_idle()
+        photo, area, options = open_photo.call_args.args
+        self.assertEqual((photo, len(area.shapes), area.image_size, options.expand), (self.photo, 1, (800, 600), 4))
+        self.assertIn("[제거]", self.app.status.get())
+
+    def test_batch_window(self):
+        folder = Path(self.tmp.name) / "사진"
+        folder.mkdir()
+        for name in ("a.jpg", "b.jpg"):
+            path = folder / name
+            Image.new("RGB", (800, 600)).save(path)
+            stamp = time.time() - 60
+            os.utime(path, (stamp, stamp))
+        settings.save_preset("워터마크", shapes.Area([shapes.rect(0, 0, 10, 10)], (800, 600), "anchor"))
+        self.app._refresh_presets()
+        self.app.method.set("action")
+        self.app.open_batch_window()
+        window = self.app._batch_window
+        self.assertEqual(window.preset.get(), "워터마크")
+        self.assertIn("Photoshop [제거] 버튼", window.method.get())
+        window.input_dir.set(str(folder))
+
+        def fake_remove(photo, area, output, options, **kwargs):
+            output.write_bytes(b"result")
+            return {"ok": True, "output": str(output), "warnings": ["참고할 점"]}
+
+        with mock.patch.object(gui.api, "remove_area", side_effect=fake_remove) as remove:
+            window.start()
+            for _ in range(200):
+                self.pump(0.02)
+                if not window.running:
+                    break
+        self.assertFalse(window.running)
+        self.assertEqual(remove.call_count, 2)
+        self.assertEqual(remove.call_args.args[3].method, "action")
+        log = window.log.get("1.0", "end")
+        self.assertIn("완료  a.jpg → a_removed.jpg", log)
+        self.assertIn("참고: 참고할 점", log)
+        self.assertIn("2장 완료", window.status.get())
+        self.assertEqual(settings.load_settings("batch")["input_dir"], str(folder))
+        # A second run finds nothing new.
+        with mock.patch.object(gui.api, "remove_area", side_effect=fake_remove) as remove:
+            window.start()
+            for _ in range(200):
+                self.pump(0.02)
+                if not window.running:
+                    break
+        remove.assert_not_called()
+        self.assertIn("새로 지울 사진이 없습니다", window.status.get())
+        window.close()
+        self.assertFalse(window.window.winfo_exists())
+
+    def test_closing_the_batch_window_while_running(self):
+        folder = Path(self.tmp.name) / "사진"
+        folder.mkdir()
+        path = folder / "a.jpg"
+        path.write_bytes(b"x")
+        stamp = time.time() - 60
+        os.utime(path, (stamp, stamp))
+        settings.save_preset("워터마크", shapes.Area([shapes.rect(0, 0, 10, 10)], (800, 600), "anchor"))
+        self.app._refresh_presets()
+        self.app.open_batch_window()
+        window = self.app._batch_window
+        window.input_dir.set(str(folder))
+        window.watch.set(True)
+        started = threading.Event()
+
+        def slow_remove(photo, area, output, options, **kwargs):
+            started.set()
+            time.sleep(0.3)
+            return {"ok": True, "output": str(output), "warnings": []}
+
+        with mock.patch.object(gui.api, "remove_area", side_effect=slow_remove), \
+                mock.patch.object(gui.messagebox, "askyesno", return_value=True):
+            window.start()
+            self.assertTrue(started.wait(5))
+            runner = window._runner
+            window.close()
+            self.pump(0.6)  # no Tk errors from a poll scheduled on the closed window
+        self.assertFalse(window.window.winfo_exists())
+        self.assertTrue(runner.stopping)
+
+    def test_batch_window_needs_a_preset_and_folder(self):
+        self.app.open_batch_window()
+        window = self.app._batch_window
+        with mock.patch.object(gui.messagebox, "showinfo") as showinfo:
+            window.start()
+        self.assertIn("공통 영역", showinfo.call_args.args[1])
+        self.assertFalse(window.running)
+
     def wait_idle(self):
         for _ in range(100):
             self.pump(0.05)
@@ -227,7 +363,7 @@ class AppTests(unittest.TestCase):
 
     def test_selection_file_round_trip_with_scaling(self):
         path = Path(self.tmp.name) / "sel.json"
-        shapes.save_selection(path, [shapes.rect(10, 10, 110, 60)], (400, 300))  # drawn on a half-size copy
+        shapes.save_area(path, shapes.Area([shapes.rect(10, 10, 110, 60)], (400, 300)))  # drawn on a half-size copy
         with mock.patch.object(gui.filedialog, "askopenfilename", return_value=str(path)):
             self.app.load_selection()
         self.assertEqual(self.app.shapes[0].box, (20, 20, 220, 120))

@@ -5,16 +5,19 @@ from __future__ import annotations
 import math
 import os
 import queue
+import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 from typing import Callable, List, Optional, Tuple
 
-from . import __version__, api
+from . import __version__, api, settings
 from . import shapes as sh
+from .batch import DEFAULT_OUTPUT_FOLDER, BatchJob, BatchRunner
 from .photoshop import PhotoshopError, ScriptFailed
 
 try:
@@ -41,6 +44,12 @@ METHOD_HINTS = {
     "transparent": "투명하게 잘라내기: 선택한 부분을 투명하게 지우고 PNG로 저장합니다.",
 }
 
+ANCHOR_HELP = ("모서리의 워터마크나 날짜처럼 자리가 정해진 영역에 알맞습니다. 기준 위치에서 떨어진 거리를 지키므로, "
+               "세로 사진이나 크기가 다른 사진에서도 같은 모서리에 놓입니다.")
+
+BATCH_NO_PRESET = ("저장된 공통 영역이 없습니다. 메인 창에서 기준 사진을 열고 지울 영역을 그린 뒤 "
+                   "[지금 영역 저장...]으로 공통 영역을 만드세요.")
+
 ACTION_INTRO = (
     "Photoshop에는 작업 표시줄의 버튼을 스크립트로 누르는 기능이 없습니다. 대신 [제거] 버튼을 누르는 과정을 "
     "Photoshop '동작'으로 한 번 녹화해 두면, 이 도구가 영역을 선택한 뒤 그 동작을 실행합니다. "
@@ -59,12 +68,20 @@ HELP_TEXT = """\
    같은 영역을 선택해 지운 다음 결과를 새 파일로 저장합니다.
    원본 사진은 바뀌지 않습니다.
 
+여러 사진에서 같은 자리를 지우려면 (공통 영역)
+  기준 사진에 지울 영역을 그리고 [지금 영역 저장...]으로 이름을 붙여 저장합니다.
+  [여러 사진 한꺼번에 지우기...]에서 사진 폴더와 공통 영역을 고르고 [시작]을 누르면
+  폴더의 사진마다 그 영역을 선택해 지웁니다. 이미 지운 사진은 건너뛰므로 새 사진이
+  생길 때마다 [시작]만 다시 누르면 되고, 폴더 감시를 켜 두면 알아서 지웁니다.
+  [이 사진에 적용]을 누르면 공통 영역이 지금 사진의 어디에 놓이는지 볼 수 있습니다.
+
 Photoshop 작업 표시줄의 [제거] 버튼으로 지우려면
   지우는 방식에서 'Photoshop [제거] 버튼'을 고르세요.
   처음 한 번은 [설정...]의 안내대로 [제거] 버튼 누르기를 동작으로 녹화해야 합니다.
 
 Photoshop의 선택 도구로 직접 고르고 싶다면
-  ① [Photoshop에서 열기]로 사진을 연 뒤 Photoshop에서 지울 부분을 선택하고
+  ① [Photoshop에서 열기]로 사진을 엽니다. 영역을 그려 두었다면 그 영역이 선택된 채로 열립니다.
+     Photoshop에서 선택을 다듬거나 새로 선택하고
   ② [Photoshop 선택 영역 지우기]를 누르세요. (Photoshop에서 Ctrl+Z로 되돌릴 수 있습니다)
 """
 
@@ -104,6 +121,8 @@ class RemoverApp:
         self.subject = tk.BooleanVar(value=False)
         self.keep_open = tk.BooleanVar(value=True)
         self.output = tk.StringVar()
+        self.preset = tk.StringVar()
+        self._batch_window: Optional[BatchWindow] = None
         self.status = tk.StringVar(value="[사진 열기]로 지울 부분이 있는 사진을 고르세요.")
 
         self._build_menu()
@@ -112,6 +131,7 @@ class RemoverApp:
         self._build_options()
         self._build_canvas()
         self._bind_keys()
+        self._refresh_presets()
         self.method.trace_add("write", lambda *_: self._on_method_change())
         self.output.trace_add("write", lambda *_: self._on_output_edited())
         self.brush_size.trace_add("write", lambda *_: self.brush_label.set(f"{self._brush_diameter()} px"))
@@ -207,8 +227,19 @@ class RemoverApp:
         ttk.Checkbutton(panel, text="끝나면 결과를 Photoshop에 열어 두기",
                         variable=self.keep_open).grid(row=2, column=3, sticky="w", padx=(12, 0), pady=(6, 0))
 
+        ttk.Label(panel, text="공통 영역").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=(6, 0))
+        common = ttk.Frame(panel)
+        common.grid(row=3, column=1, columnspan=3, sticky="w", pady=(6, 0))
+        self.preset_box = ttk.Combobox(common, textvariable=self.preset, state="readonly", width=18)
+        self.preset_box.pack(side=tk.LEFT)
+        ttk.Button(common, text="이 사진에 적용", command=self.apply_preset).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(common, text="지금 영역 저장...", command=self.save_preset).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(common, text="삭제", command=self.delete_preset).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(common, text="여러 사진 한꺼번에 지우기...", style="Accent.TButton",
+                   command=self.open_batch_window).pack(side=tk.LEFT, padx=(16, 0))
+
         actions = ttk.Frame(panel)
-        actions.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        actions.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         self.run_button = ttk.Button(actions, text="▶  Photoshop에서 지우기", style="Accent.TButton",
                                      command=self.run_remove)
         self.run_button.pack(side=tk.LEFT)
@@ -525,10 +556,10 @@ class RemoverApp:
         if not resolved:
             return
         output, overwrite = resolved
-        photo, shapes, size = self.photo_path, list(self.shapes), self.image_size
+        photo, area = self.photo_path, sh.Area(list(self.shapes), self.image_size)
         self._start(
             "Photoshop에서 지우는 중입니다... (Photoshop을 처음 실행할 때는 시간이 걸립니다)",
-            lambda: api.remove_area(photo, shapes, output, options, image_size=size, overwrite=overwrite),
+            lambda: api.remove_area(photo, area, output, options, overwrite=overwrite),
             self._removed,
         )
 
@@ -538,9 +569,22 @@ class RemoverApp:
         if not self.photo_path:
             messagebox.showinfo(APP_TITLE, "먼저 [사진 열기]로 사진을 고르세요.")
             return
-        photo = self.photo_path
-        self._start("Photoshop에서 사진을 여는 중입니다...", lambda: api.open_photo(photo), lambda result: self.status.set(
-            "Photoshop에서 사진을 열었습니다. Photoshop에서 지울 부분을 선택한 뒤 [② Photoshop 선택 영역 지우기]를 누르세요."))
+        photo, area, options = self.photo_path, None, None
+        if sh.has_area(self.shapes):
+            # Select the drawn area too, e.g. to press Photoshop's own Remove button next.
+            options = self._options()
+            if options is None:
+                return
+            area = sh.Area(list(self.shapes), self.image_size)
+        self._start("Photoshop에서 사진을 여는 중입니다...", lambda: api.open_photo(photo, area, options), self._opened)
+
+    def _opened(self, result: dict) -> None:
+        if result.get("selectionBounds"):
+            self.status.set("Photoshop에서 사진을 열고 그린 영역을 선택했습니다. Photoshop 작업 표시줄의 [제거]를 누르거나, "
+                            "선택을 다듬은 뒤 [② Photoshop 선택 영역 지우기]를 누르세요.")
+        else:
+            self.status.set("Photoshop에서 사진을 열었습니다. Photoshop에서 지울 부분을 선택한 뒤 "
+                            "[② Photoshop 선택 영역 지우기]를 누르세요.")
 
     def run_remove_current(self) -> None:
         if self._busy:
@@ -622,6 +666,62 @@ class RemoverApp:
         self.status.set("실패: " + text.splitlines()[0])
         messagebox.showerror(APP_TITLE, text)
 
+    # ------------------------------------------------------ common areas
+
+    def _refresh_presets(self, select: Optional[str] = None) -> None:
+        names = settings.list_presets()
+        self.preset_box.configure(values=names)
+        if select is not None:
+            self.preset.set(select)
+        elif self.preset.get() not in names:
+            self.preset.set(names[0] if names else "")
+
+    def save_preset(self) -> Optional["PresetDialog"]:
+        if self.preview is None or not sh.has_area(self.shapes):
+            messagebox.showinfo(APP_TITLE, "먼저 사진을 열고, 여러 사진에서 지울 공통 영역을 그리세요.")
+            return None
+        return PresetDialog(self)
+
+    def apply_preset(self) -> None:
+        name = self.preset.get()
+        if not name:
+            messagebox.showinfo(APP_TITLE, "저장된 공통 영역이 없습니다. 영역을 그린 뒤 [지금 영역 저장...]을 누르세요.")
+            return
+        if self.preview is None:
+            messagebox.showinfo(APP_TITLE, "먼저 미리보기가 되는 사진을 여세요.")
+            return
+        try:
+            area = settings.load_preset(name)
+            self.shapes = area.on_photo(self.image_size)
+        except sh.SelectionError as exc:
+            messagebox.showerror(APP_TITLE, str(exc))
+            return
+        self._schedule_render()
+        self.status.set(f"공통 영역 '{name}'을(를) 이 사진에 놓았습니다 ({area.describe()}).")
+
+    def delete_preset(self) -> None:
+        name = self.preset.get()
+        if not name or not messagebox.askyesno(APP_TITLE, f"공통 영역 '{name}'을(를) 삭제할까요?"):
+            return
+        settings.delete_preset(name)
+        self._refresh_presets()
+        self.status.set(f"공통 영역 '{name}'을(를) 삭제했습니다.")
+
+    def open_batch_window(self) -> None:
+        if self._batch_window is not None and self._batch_window.window.winfo_exists():
+            self._batch_window.window.lift()
+            return
+        self._batch_window = BatchWindow(self)
+
+    def method_summary(self) -> str:
+        names = {"content-aware": "내용 인식 채우기", "action": "Photoshop [제거] 버튼", "transparent": "투명하게 잘라내기"}
+        text = f"{names.get(self.method.get(), self.method.get())}, 넓히기 {self.expand.get()}px"
+        if self.feather.get().strip() not in ("", "0", "0.0"):
+            text += f", 부드럽게 {self.feather.get()}px"
+        if self.subject.get():
+            text += ", 피사체 선택"
+        return text
+
     # ------------------------------------------------------ recorded action
 
     def open_action_settings(self) -> None:
@@ -689,7 +789,7 @@ class RemoverApp:
         path = filedialog.asksaveasfilename(title="선택 영역 저장", defaultextension=".json", initialfile=initial,
                                             filetypes=[("선택 영역", "*.json")])
         if path:
-            sh.save_selection(path, self.shapes, self.image_size)
+            sh.save_area(path, sh.Area(list(self.shapes), self.image_size))
             self.status.set(f"선택 영역을 저장했습니다: {path}  (명령줄에서 --selection 으로 여러 사진에 쓸 수 있습니다)")
 
     def load_selection(self) -> None:
@@ -700,10 +800,8 @@ class RemoverApp:
         if not path:
             return
         try:
-            loaded, size = sh.load_selection(path)
-            if size and size != self.image_size:
-                loaded = [s.scaled(self.image_size[0] / size[0], self.image_size[1] / size[1]) for s in loaded]
-        except (sh.SelectionError, ZeroDivisionError) as exc:
+            loaded = sh.load_area(path).on_photo(self.image_size)
+        except sh.SelectionError as exc:
             messagebox.showerror(APP_TITLE, str(exc))
             return
         self.shapes = loaded
@@ -724,13 +822,290 @@ class RemoverApp:
         if not path:
             return
         try:
-            config = api.build_remove_config(self.photo_path, output, self.shapes, options, self.image_size)
+            config = api.build_remove_config(self.photo_path, output, sh.Area(list(self.shapes), self.image_size),
+                                             options)
             written = api.export_script(path, config)
         except (api.JobError, OSError) as exc:
             messagebox.showerror(APP_TITLE, str(exc))
             return
         messagebox.showinfo(APP_TITLE, f"스크립트를 저장했습니다:\n{written}\n\n"
                                        "Photoshop의 [파일 > 스크립트 > 찾아보기...]에서 이 파일을 실행하세요.")
+
+
+class PresetDialog:
+    """Save the drawn shapes as a named common area."""
+
+    def __init__(self, app: RemoverApp):
+        self.app = app
+        self.window = tk.Toplevel(app.root)
+        self.window.title("공통 영역 저장")
+        self.window.transient(app.root)
+        self.window.resizable(False, False)
+        self.name = tk.StringVar(value=app.preset.get())
+        self.fit = tk.StringVar(value="anchor")
+        self.anchor = tk.StringVar(value=sh.ANCHOR_LABELS[sh.auto_anchor(app.shapes, app.image_size)])
+
+        body = ttk.Frame(self.window, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="이름").grid(row=0, column=0, sticky="w")
+        entry = ttk.Entry(body, textvariable=self.name, width=30)
+        entry.grid(row=0, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        ttk.Label(body, text="크기나 방향이 다른 사진에서는", justify="left").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(14, 4))
+        ttk.Radiobutton(body, text="기준 위치에 맞추기:", value="anchor", variable=self.fit).grid(
+            row=2, column=0, columnspan=2, sticky="w")
+        ttk.Combobox(body, textvariable=self.anchor, values=list(sh.ANCHOR_LABELS.values()), state="readonly",
+                     width=12).grid(row=3, column=0, columnspan=3, sticky="w", padx=(24, 0))
+        ttk.Label(body, text=ANCHOR_HELP, wraplength=440, justify="left").grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=(24, 0), pady=(2, 6))
+        ttk.Radiobutton(body, text="사진 크기에 비례해서 늘리기", value="stretch", variable=self.fit).grid(
+            row=5, column=0, columnspan=3, sticky="w")
+        ttk.Radiobutton(body, text="크기나 가로세로 비율이 같은 사진에만 쓰기", value="exact", variable=self.fit).grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        buttons = ttk.Frame(body)
+        buttons.grid(row=7, column=0, columnspan=3, sticky="e", pady=(16, 0))
+        ttk.Button(buttons, text="저장", command=self.save).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="취소", command=self.window.destroy).pack(side=tk.LEFT, padx=(6, 0))
+        self.window.bind("<Return>", lambda e: self.save())
+        self.window.bind("<Escape>", lambda e: self.window.destroy())
+        entry.focus_set()
+
+    def save(self) -> None:
+        try:
+            name = settings.check_preset_name(self.name.get())
+        except sh.SelectionError as exc:
+            messagebox.showerror("공통 영역 저장", str(exc), parent=self.window)
+            return
+        if any(existing.casefold() == name.casefold() for existing in settings.list_presets()) and \
+                not messagebox.askyesno("공통 영역 저장", f"'{name}' 공통 영역을 덮어쓸까요?", parent=self.window):
+            return
+        fit = self.fit.get()
+        anchor = next(key for key, label in sh.ANCHOR_LABELS.items() if label == self.anchor.get())
+        try:
+            area = sh.Area(list(self.app.shapes), self.app.image_size, fit, anchor if fit == "anchor" else None)
+            settings.save_preset(name, area)
+        except (OSError, sh.SelectionError) as exc:
+            messagebox.showerror("공통 영역 저장", str(exc), parent=self.window)
+            return
+        self.app._refresh_presets(select=name)
+        self.app.status.set(f"공통 영역 '{name}'을(를) 저장했습니다. [여러 사진 한꺼번에 지우기...]에서 쓸 수 있습니다.")
+        self.window.destroy()
+
+
+class BatchWindow:
+    """Remove a common area from every photo in a folder, once or whenever new photos arrive."""
+
+    MAX_LOG_LINES = 2000
+
+    def __init__(self, app: RemoverApp):
+        self.app = app
+        saved = settings.load_settings("batch")
+        self.window = tk.Toplevel(app.root)
+        self.window.title("여러 사진 한꺼번에 지우기")
+        self.window.minsize(640, 460)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        self.preset = tk.StringVar(value=saved.get("preset") or app.preset.get())
+        self.input_dir = tk.StringVar(value=saved.get("input_dir", ""))
+        self.output_dir = tk.StringVar(value=saved.get("output_dir", ""))
+        self.skip_done = tk.BooleanVar(value=saved.get("skip_done", True))
+        self.watch = tk.BooleanVar(value=saved.get("watch", False))
+        self.interval = tk.StringVar(value=str(saved.get("interval", 10)))
+        self.method = tk.StringVar(value=app.method_summary())
+        self.status = tk.StringVar(value="사진 폴더와 공통 영역을 고른 뒤 [시작]을 누르세요.")
+        self._events: "queue.Queue" = queue.Queue()
+        self._runner: Optional[BatchRunner] = None
+        self._poll_after: Optional[str] = None
+        self._build()
+        self.window.bind("<FocusIn>", lambda e: self.method.set(self.app.method_summary()))
+
+    def _build(self) -> None:
+        body = ttk.Frame(self.window, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(7, weight=1)
+
+        ttk.Label(body, text="공통 영역").grid(row=0, column=0, sticky="w")
+        self.preset_box = ttk.Combobox(body, textvariable=self.preset, values=settings.list_presets(),
+                                       state="readonly", width=24)
+        self.preset_box.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(body, text="사진 폴더").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(body, textvariable=self.input_dir).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Button(body, text="찾아보기...", command=lambda: self._choose_dir(self.input_dir)).grid(
+            row=1, column=2, padx=(6, 0), pady=(8, 0))
+        ttk.Label(body, text="저장 폴더").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(body, textvariable=self.output_dir).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Button(body, text="찾아보기...", command=lambda: self._choose_dir(self.output_dir)).grid(
+            row=2, column=2, padx=(6, 0), pady=(8, 0))
+        ttk.Label(body, text=f"비워 두면 사진 폴더 안의 '{DEFAULT_OUTPUT_FOLDER}' 폴더에 저장합니다.",
+                  foreground="#666666").grid(row=3, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        ttk.Label(body, text="지우는 방식").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(body, textvariable=self.method).grid(row=4, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        repeat = ttk.Frame(body)
+        repeat.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(repeat, text="이미 지운 사진은 건너뛰기 (저장 폴더에 결과가 있는 사진)",
+                        variable=self.skip_done).pack(anchor="w")
+        watch = ttk.Frame(repeat)
+        watch.pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(watch, text="끝난 뒤에도 폴더를 지켜보다가 새 사진이 들어오면 자동으로 지우기, 확인 간격",
+                        variable=self.watch).pack(side=tk.LEFT)
+        ttk.Spinbox(watch, from_=2, to=3600, width=5, textvariable=self.interval).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(watch, text="초").pack(side=tk.LEFT)
+
+        controls = ttk.Frame(body)
+        controls.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 6))
+        self.start_button = ttk.Button(controls, text="▶  시작", style="Accent.TButton", command=self.start)
+        self.start_button.pack(side=tk.LEFT)
+        self.stop_button = ttk.Button(controls, text="멈춤", command=self.stop, state="disabled")
+        self.stop_button.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(controls, text="저장 폴더 열기", command=self.open_output).pack(side=tk.LEFT, padx=(6, 0))
+        self.progress = ttk.Progressbar(controls, mode="determinate", length=180)
+        self.progress.pack(side=tk.RIGHT)
+
+        log_frame = ttk.Frame(body)
+        log_frame.grid(row=7, column=0, columnspan=3, sticky="nsew")
+        self.log = tk.Text(log_frame, height=12, wrap="word", state="disabled")
+        scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log.yview)
+        self.log.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Label(body, textvariable=self.status, wraplength=600, justify="left").grid(
+            row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+    def _choose_dir(self, variable: tk.StringVar) -> None:
+        path = filedialog.askdirectory(parent=self.window, initialdir=variable.get() or self.input_dir.get() or None)
+        if path:
+            variable.set(path)
+
+    @property
+    def running(self) -> bool:
+        return self._runner is not None
+
+    def start(self) -> None:
+        if self.running:
+            return
+        if not self.preset.get():
+            messagebox.showinfo("여러 사진 한꺼번에 지우기", BATCH_NO_PRESET, parent=self.window)
+            return
+        if not self.input_dir.get().strip():
+            messagebox.showinfo("여러 사진 한꺼번에 지우기", "사진이 들어 있는 폴더를 고르세요.", parent=self.window)
+            return
+        options = self.app._options()
+        if options is None:
+            return
+        try:
+            interval = max(2.0, float(self.interval.get()))
+            output = self.output_dir.get().strip()
+            job = BatchJob(Path(self.input_dir.get().strip()), settings.load_preset(self.preset.get()),
+                           Path(output) if output else None, options, skip_done=self.skip_done.get())
+        except (ValueError, sh.SelectionError) as exc:  # JobError is a ValueError
+            messagebox.showerror("여러 사진 한꺼번에 지우기", str(exc), parent=self.window)
+            return
+        self._save_settings()
+        self.method.set(self.app.method_summary())
+        self._runner = BatchRunner(job, self._events.put)
+        self._log(f"시작: {job.input_dir} → {job.output_dir} ('{self.preset.get()}', {self.method.get()})")
+        self._set_running(True)
+        watch = self.watch.get()
+        threading.Thread(target=self._run, args=(self._runner, watch, interval), daemon=True).start()
+        self._poll_after = self.window.after(150, self._poll)
+
+    def _run(self, runner: BatchRunner, watch: bool, interval: float) -> None:
+        try:
+            runner.run(watch=watch, interval=interval)
+        except Exception as exc:  # noqa: BLE001 - shown in the log instead of vanishing with the thread
+            self._events.put({"type": "finished", "done": runner.done, "failed": len(runner.failed),
+                              "error": f"예상하지 못한 오류: {exc!r}"})
+
+    def stop(self) -> None:
+        if self._runner is not None:
+            self._runner.stop()
+            self.status.set("지금 처리 중인 사진을 끝내고 멈춥니다...")
+
+    def _poll(self) -> None:
+        self._poll_after = None
+        while True:
+            try:
+                event = self._events.get_nowait()
+            except queue.Empty:
+                break
+            self._handle(event)
+        if self.running:
+            self._poll_after = self.window.after(150, self._poll)
+
+    def _handle(self, event: dict) -> None:
+        kind = event["type"]
+        if kind == "start":
+            self.progress.configure(maximum=event["count"], value=event["index"])
+            self.status.set(f"{event['index'] + 1}/{event['count']}  {event['photo'].name} 지우는 중...")
+        elif kind == "done":
+            self.progress.configure(value=float(self.progress.cget("value")) + 1)
+            self._log(f"완료  {event['photo'].name} → {Path(event['result'].get('output') or '').name}")
+            for warning in event["result"].get("warnings") or []:
+                self._log(f"      참고: {warning}")
+        elif kind == "failed":
+            self.progress.configure(value=float(self.progress.cget("value")) + 1)
+            self._log(f"실패  {event['photo'].name}: {event['error']}")
+        elif kind == "error":
+            self._log(f"오류  {event['error']}")
+        elif kind == "waiting":
+            self._log("새 사진을 기다리는 중...")
+            self.status.set("새 사진을 기다리고 있습니다. 사진 폴더에 사진을 넣으면 자동으로 지웁니다.")
+        elif kind == "finished":
+            self._runner = None
+            self._set_running(False)
+            summary = f"끝났습니다: {event['done']}장 완료, {event['failed']}장 실패"
+            if event.get("error"):
+                summary += f" (멈춘 이유: {event['error']})"
+            elif not event["done"] and not event["failed"]:
+                summary = "새로 지울 사진이 없습니다."
+            self._log(summary)
+            self.status.set(summary)
+
+    def _log(self, text: str) -> None:
+        self.log.configure(state="normal")
+        self.log.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n")
+        lines = int(self.log.index("end-1c").split(".")[0])
+        if lines > self.MAX_LOG_LINES:
+            self.log.delete("1.0", f"{lines - self.MAX_LOG_LINES}.0")
+        self.log.configure(state="disabled")
+        self.log.see("end")
+
+    def _set_running(self, running: bool) -> None:
+        self.start_button.configure(state="disabled" if running else "normal")
+        self.stop_button.configure(state="normal" if running else "disabled")
+        if running:
+            self.progress.configure(value=0, maximum=1)
+            self.status.set("시작합니다. Photoshop을 처음 실행할 때는 시간이 걸립니다...")
+
+    def open_output(self) -> None:
+        output = self.output_dir.get().strip()
+        folder = Path(output) if output else (Path(self.input_dir.get().strip()) / DEFAULT_OUTPUT_FOLDER
+                                              if self.input_dir.get().strip() else None)
+        if folder is None or not folder.is_dir():
+            messagebox.showinfo("여러 사진 한꺼번에 지우기", "저장 폴더가 아직 없습니다.", parent=self.window)
+            return
+        open_folder(folder)
+
+    def _save_settings(self) -> None:
+        try:
+            settings.save_settings("batch", {
+                "preset": self.preset.get(), "input_dir": self.input_dir.get().strip(),
+                "output_dir": self.output_dir.get().strip(), "skip_done": self.skip_done.get(),
+                "watch": self.watch.get(), "interval": self.interval.get(),
+            })
+        except OSError:
+            pass  # remembering the choices is a convenience
+
+    def close(self) -> None:
+        if self.running:
+            if not messagebox.askyesno("여러 사진 한꺼번에 지우기", "처리를 멈추고 창을 닫을까요?", parent=self.window):
+                return
+            self.stop()  # the photo in progress finishes in the background
+        if self._poll_after is not None:
+            self.window.after_cancel(self._poll_after)
+        self._save_settings()
+        self.window.destroy()
 
 
 # ---------------------------------------------------------------- images
@@ -804,6 +1179,16 @@ def _register_heif() -> None:
     except ImportError:
         return
     register_heif_opener()
+
+
+def open_folder(path: Path) -> None:
+    """Show ``path`` in Explorer / Finder / the desktop's file manager."""
+    if sys.platform == "win32":
+        os.startfile(str(path))  # noqa: S606 - opening a folder the user chose
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
 
 
 def _hex(rgb) -> str:

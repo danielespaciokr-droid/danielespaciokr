@@ -5,11 +5,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Optional
 
 from .photoshop import run_jsx
 from .script import build_script
-from .shapes import Shape, has_area, selection_ops
+from .shapes import Area, has_area, selection_ops
 
 METHODS = ("content-aware", "action", "transparent")
 DEFAULT_ACTION_SET = "ps-remover"
@@ -19,7 +19,9 @@ DEFAULT_ACTION_NAME = "제거"
 # play an Action in which the user recorded pressing one.
 ACTION_SETUP_HELP = f"""\
 Photoshop 작업 표시줄의 [제거] 버튼을 쓰려면 한 번만 동작으로 녹화해 두세요:
-  1. Photoshop에서 아무 사진이나 열고 지울 부분을 선택합니다.
+  1. 지울 부분이 선택된 사진을 Photoshop에 띄웁니다. 이 도구에서 영역을 그리거나 공통 영역을 적용한 뒤
+     [① Photoshop에서 열기]를 누르면, 사진이 열리고 그 영역이 선택됩니다.
+     (명령줄: ps-remover open 사진.jpg --preset 공통영역이름)
   2. [창 > 동작]을 엽니다 (단축키 Windows: Alt+F9, macOS: Option+F9).
      동작 패널 아래의 폴더 아이콘을 눌러 새 세트를 '{DEFAULT_ACTION_SET}' 이름으로 만듭니다.
   3. 그 세트에 새 동작을 '{DEFAULT_ACTION_NAME}' 이름으로 만들고 [기록]을 누릅니다.
@@ -84,12 +86,12 @@ def default_output_path(photo, method: str = "content-aware", suffix: str = DEFA
     return candidate
 
 
-def build_remove_config(photo, output, shapes: Sequence[Shape], options: Optional[RemoveOptions] = None,
-                        image_size: Optional[Tuple[int, int]] = None, report: str = "return") -> dict:
+def build_remove_config(photo, output, area: Area, options: Optional[RemoveOptions] = None,
+                        report: str = "return") -> dict:
     """The job description the Photoshop script expects for the "remove" action."""
     options = options or RemoveOptions()
     options.validate()
-    if not has_area(shapes) and not options.subject:
+    if not has_area(area.shapes) and not options.subject:
         raise JobError("지울 영역이 없습니다. 영역을 선택하거나 '피사체 선택'을 켜세요.")
     output = Path(output)
     if output.suffix.lower() not in SAVE_EXTENSIONS:
@@ -98,9 +100,8 @@ def build_remove_config(photo, output, shapes: Sequence[Shape], options: Optiona
         "action": "remove",
         "input": _abspath(photo),
         "output": _abspath(output),
-        "ops": selection_ops(shapes),
+        **_area_config(area),
         "subject": bool(options.subject),
-        "expectedSize": [int(image_size[0]), int(image_size[1])] if image_size else None,
         "method": options.method,
         "actionSet": options.action_set,
         "actionName": options.action_name,
@@ -112,14 +113,14 @@ def build_remove_config(photo, output, shapes: Sequence[Shape], options: Optiona
     }
 
 
-def remove_area(photo, shapes: Sequence[Shape], output=None, options: Optional[RemoveOptions] = None,
-                image_size: Optional[Tuple[int, int]] = None, overwrite: bool = False,
-                photoshop: Optional[str] = None, timeout: Optional[float] = None) -> dict:
-    """Open ``photo`` in Photoshop, select ``shapes``, remove them and save to ``output``.
+def remove_area(photo, area: Area, output=None, options: Optional[RemoveOptions] = None,
+                overwrite: bool = False, photoshop: Optional[str] = None,
+                timeout: Optional[float] = None) -> dict:
+    """Open ``photo`` in Photoshop, select ``area``, remove it and save to ``output``.
 
-    ``image_size`` is the (width, height) the shapes were drawn on; if Photoshop
-    opens the photo at another size with the same aspect ratio, the shapes are
-    scaled to match. Returns the script's report (``output``, ``warnings``, ...).
+    If Photoshop opens the photo at another size than ``area.image_size``, the
+    shapes are placed according to ``area.fit``. Returns the script's report
+    (``output``, ``warnings``, ...).
     """
     options = options or RemoveOptions()
     photo = Path(photo)
@@ -130,16 +131,32 @@ def remove_area(photo, shapes: Sequence[Shape], output=None, options: Optional[R
         if _same_file(output, photo):
             raise JobError("결과를 원본 사진에 덮어쓰려면 overwrite 옵션을 켜세요.")
         raise JobError(f"같은 이름의 파일이 이미 있습니다: {output}")
-    config = build_remove_config(photo, output, shapes, options, image_size)
+    config = build_remove_config(photo, output, area, options)
     return run_jsx(build_script(config), photoshop=photoshop, timeout=timeout)
 
 
-def open_photo(photo, photoshop: Optional[str] = None, timeout: Optional[float] = None) -> dict:
-    """Start Photoshop (if needed) and open ``photo`` so the user can select in Photoshop."""
+def build_open_config(photo, area: Optional[Area] = None, options: Optional[RemoveOptions] = None,
+                      report: str = "return") -> dict:
+    """Job description for opening a photo, with ``area`` selected if given."""
+    options = options or RemoveOptions()
+    config = {"action": "open", "input": _abspath(photo), "report": report}
+    if area is not None and has_area(area.shapes):
+        options.validate()
+        config.update(_area_config(area), expand=int(options.expand), feather=float(options.feather))
+    return config
+
+
+def open_photo(photo, area: Optional[Area] = None, options: Optional[RemoveOptions] = None,
+               photoshop: Optional[str] = None, timeout: Optional[float] = None) -> dict:
+    """Start Photoshop (if needed) and open ``photo``.
+
+    With ``area`` the area is selected too (grown by ``options.expand``), ready
+    for Photoshop's own tools, e.g. the Contextual Task Bar's Remove button.
+    """
     photo = Path(photo)
     if not photo.is_file():
         raise JobError(f"사진 파일을 찾을 수 없습니다: {photo}")
-    config = {"action": "open", "input": _abspath(photo), "report": "return"}
+    config = build_open_config(photo, area, options)
     return run_jsx(build_script(config), photoshop=photoshop, timeout=timeout)
 
 
@@ -195,6 +212,16 @@ def export_script(path, config: dict) -> Path:
         path = path.with_name(path.name + ".jsx")
     path.write_text(build_script(dict(config, report="alert")), encoding="ascii", newline="\n")
     return path
+
+
+def _area_config(area: Area) -> dict:
+    size = area.image_size
+    return {
+        "ops": selection_ops(area.shapes),
+        "expectedSize": [size[0], size[1]] if size else None,
+        "fit": area.fit,
+        "anchor": list(area.anchor) if area.anchor is not None else None,
+    }
 
 
 def _abspath(path) -> str:

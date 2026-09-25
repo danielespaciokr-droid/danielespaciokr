@@ -17,12 +17,9 @@ PHOTO = "/photos/고양이.jpg"
 OUTPUT = "/photos/고양이_removed.jpg"
 
 
-def remove_config(shape_list=None, options=None, image_size=None, **overrides):
-    config = api.build_remove_config(
-        "photo.jpg", "out.jpg",
-        [shapes.rect(100, 50, 300, 250)] if shape_list is None else shape_list,
-        options or api.RemoveOptions(), image_size,
-    )
+def remove_config(shape_list=None, options=None, image_size=None, fit="exact", **overrides):
+    area = shapes.Area([shapes.rect(100, 50, 300, 250)] if shape_list is None else shape_list, image_size, fit)
+    config = api.build_remove_config("photo.jpg", "out.jpg", area, options or api.RemoveOptions())
     config.update(input=PHOTO, output=OUTPUT)
     config.update(overrides)
     return config
@@ -182,6 +179,27 @@ class JsxEngineTests(unittest.TestCase):
         box = self.actions(out, "setd")[0][2]["T   "]["desc"]
         self.assertEqual((box["Left"]["value"], box["Top "]["value"], box["Rght"]["value"], box["Btom"]["value"]),
                          (200, 100, 600, 500))
+
+    def selected_box(self, out):
+        box = self.actions(out, "setd")[0][2]["T   "]["desc"]
+        return tuple(round(box[k]["value"], 3) for k in ("Left", "Top ", "Rght", "Btom"))
+
+    def test_fit_modes_match_python(self):
+        watermark = [shapes.rect(3500, 2800, 3980, 2980)]  # bottom-right corner of a 4000x3000 photo
+        for fit, size, expected in (
+            ("anchor", (3000, 4000), (2500, 3800, 2980, 3980)),  # portrait: still bottom-right, same margins
+            ("anchor", (2000, 1500), (1750, 1400, 1990, 1490)),  # same ratio: plain scaling
+            ("stretch", (2000, 3000), (1750, 2800, 1990, 2980)),
+        ):
+            with self.subTest(fit=fit, size=size):
+                area = shapes.Area(watermark, (4000, 3000), fit)
+                python_box = tuple(round(v, 3) for v in area.on_photo(size)[0].box)
+                self.assertEqual(python_box, expected)
+                config = remove_config(watermark, image_size=(4000, 3000), fit=fit)
+                out = self.run_script(config, images={PHOTO: {"width": size[0], "height": size[1]}})
+                self.assertTrue(out["report"]["ok"], out["report"].get("error"))
+                self.assertEqual(self.selected_box(out), expected)
+                self.assertEqual(out["report"]["warnings"], [])  # expected for these fits, not worth a warning
 
     def test_rotated_photo_is_reported(self):
         out = self.run_script(remove_config(image_size=(3000, 4000)))
@@ -417,6 +435,22 @@ class JsxEngineTests(unittest.TestCase):
         self.assertTrue(out["report"]["ok"])
         self.assertEqual(out["report"]["document"]["name"], "고양이.jpg")
         self.assertEqual([d["file"] for d in out["documents"]], [PHOTO])
+        self.assertNotIn("selectionBounds", out["report"])
+        self.assertEqual(self.actions(out), [])
+
+    def test_open_with_area_selects_it(self):
+        area = shapes.Area([shapes.rect(3500, 2800, 3980, 2980)], (4000, 3000), "anchor")
+        config = api.build_open_config("photo.jpg", area, api.RemoveOptions(expand=2))
+        config["input"] = PHOTO
+        out = self.run_script(config, images={PHOTO: {"width": 3000, "height": 4000, "resolution": 300}})
+        report = out["report"]
+        self.assertTrue(report["ok"], report.get("error"))
+        self.assertEqual(report["selectionBounds"], [2498, 3798, 2982, 3982])
+        self.assertEqual(self.calls(out, "suspendHistory")[0][2], "영역 선택 (ps-remover)")
+        self.assertEqual(self.actions(out, "Fl  "), [])
+        self.assertEqual(self.calls(out, "saveAs"), [])
+        self.assertEqual(out["documents"][0]["selection"], [2498, 3798, 2982, 3982])  # left selected
+        self.assertEqual(out["documents"][0]["resolution"], 300)
 
     def test_remove_current_selection(self):
         config = api.build_remove_current_config(api.RemoveOptions(), output=None)
