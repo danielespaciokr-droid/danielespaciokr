@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Collection, Dict, List, Optional, Set, Tuple, Union
 
-from . import api
+from . import api, textfind
 from .photoshop import PhotoshopError, PhotoshopNotFound, ScriptFailed, UnsupportedPlatform
 from .shapes import Area, AreaSet, area_has_shapes
 
@@ -41,6 +41,7 @@ class BatchJob:
     options: api.RemoveOptions = field(default_factory=api.RemoveOptions)
     suffix: str = api.DEFAULT_SUFFIX
     skip_done: bool = True  # leave a photo alone when its result already exists
+    find_text: bool = False  # move the area onto the text found in each photo (see ps_remover.textfind)
     photoshop: Optional[str] = None
     timeout: Optional[float] = None
 
@@ -101,7 +102,7 @@ class BatchRunner:
 
     Each event is a dict with a "type":
       start     photo, index, count     about to process a photo of this round
-      done      photo, result
+      done      photo, result           result["textNote"]: what finding the text did, if asked to
       failed    photo, error, result    that photo failed (it is not retried); the run goes on
       error     error, retry            trouble that is not the photo's (Photoshop, a recorded action
                                         missing, the folder away); with retry (watch mode) it is tried
@@ -110,10 +111,12 @@ class BatchRunner:
       finished  done, failed, error     the run is over
     """
 
-    def __init__(self, job: BatchJob, on_event: Callable[[dict], None], remove: Optional[Callable] = None):
+    def __init__(self, job: BatchJob, on_event: Callable[[dict], None], remove: Optional[Callable] = None,
+                 locate: Optional[Callable] = None):
         self.job = job
         self.on_event = on_event
         self._remove = remove or api.remove_area
+        self._locate = locate or textfind.place
         self._stop = threading.Event()
         self.handled: Set[Path] = set()
         self.failed: Set[Path] = set()
@@ -205,8 +208,9 @@ class BatchRunner:
             if self._stop.is_set():
                 break
             self._emit("start", photo=photo, index=index, count=len(photos))
+            area, note = self._area_for(photo)
             try:
-                result = self._remove(photo, self.job.area, self.job.output_for(photo), self.job.options,
+                result = self._remove(photo, area, self.job.output_for(photo), self.job.options,
                                       overwrite=not self.job.skip_done, photoshop=self.job.photoshop,
                                       timeout=self.job.timeout)
             except ScriptFailed as exc:
@@ -226,8 +230,22 @@ class BatchRunner:
                 self.handled.add(photo)
                 self.done += 1
                 self._retries, self._last_error = 0, None
-                self._emit("done", photo=photo, result=result)
+                self._emit("done", photo=photo, result=dict(result, textNote=note) if note else result)
         return "ok", None
+
+    def _area_for(self, photo: Path) -> Tuple[Union[Area, AreaSet], Optional[str]]:
+        """The area to remove on ``photo`` and a note on finding its text, if that was asked for."""
+        if not self.job.find_text:
+            return self.job.area, None
+        try:
+            placement = self._locate(photo, self.job.area)
+        except textfind.TextFindUnavailable as exc:
+            return self.job.area, f"글자 찾기 못 함: {exc}"
+        except Exception as exc:  # noqa: BLE001 - finding the text must never stop the run
+            return self.job.area, f"글자 찾기 오류: {exc!r}"
+        if placement.found is None:
+            return self.job.area, placement.note  # as saved, exactly as without finding text
+        return placement.area, placement.note
 
     def _trouble(self, error: str, watch: bool) -> Tuple[str, str]:
         """Report trouble that is not a photo's; watch mode tries again later."""

@@ -229,6 +229,49 @@ class AppTests(unittest.TestCase):
         self.assertEqual(app.method.get(), "content-aware")  # the removal method is left alone
         self.assertEqual(app.action_status.get(), "")
 
+    def test_find_text_here(self):
+        app = self.app
+        found = gui.textfind.FoundText((600, 560, 780, 585), 18.0, 0.9)
+        area = shapes.Area([shapes.rect(590, 550, 790, 595)], (800, 600))
+        with mock.patch.object(gui.textfind, "place", return_value=gui.textfind.Placement(area, found, "글자 찾음")) as place:
+            app.find_text_here()
+            self.wait_idle()
+        self.assertEqual(place.call_args.args, (self.photo, None))  # no common area chosen: just the corner
+        self.assertEqual([s.box for s in app.shapes], [(590, 550, 790, 595)])
+        self.assertIn("글자를 찾았습니다 (가로 180 x 세로 25 px)", app.status.get())
+        # With a common area chosen, the text is looked for where that area expects it.
+        settings.save_preset("글씨", shapes.Area([shapes.rect(700, 560, 790, 590)], (800, 600), "anchor"))
+        app._refresh_presets(select="글씨")
+        missed = gui.textfind.Placement(settings.load_preset("글씨").for_size((800, 600)), None, "글자 못 찾음")
+        with mock.patch.object(gui.textfind, "place", return_value=missed) as place:
+            app.find_text_here()
+            self.wait_idle()
+        self.assertEqual(set(place.call_args.args[1].areas), {"landscape"})
+        self.assertEqual([s.box for s in app.shapes], [(700, 560, 790, 590)])  # where it was saved
+        self.assertIn("글자를 찾지 못해서", app.status.get())
+        with mock.patch.object(gui.textfind, "available", return_value=False), \
+                mock.patch.object(gui.messagebox, "showinfo") as showinfo:
+            app.find_text_here()
+        self.assertIn("numpy", showinfo.call_args.args[1])
+
+    def test_saving_a_common_area_remembers_where_the_text_is(self):
+        app = self.app
+        self.drag((600, 540), (780, 590))
+        with mock.patch.object(gui.textfind, "learn_text_box", return_value=(610.0, 550.0, 770.0, 580.0)) as learn:
+            dialog = app.save_preset()
+            dialog.name.set("글씨")
+            dialog.save()
+        self.assertEqual(learn.call_args.args[0], self.photo)
+        saved = settings.load_preset("글씨").for_orientation("landscape")
+        self.assertEqual(saved.text_box, (610.0, 550.0, 770.0, 580.0))
+        self.assertIn("글자 위치도 기억해서", app.status.get())
+        with mock.patch.object(gui.textfind, "learn_text_box", return_value=None):
+            dialog = app.save_preset()
+            dialog.name.set("글자 없음")
+            dialog.save()
+        self.assertIsNone(settings.load_preset("글자 없음").for_orientation("landscape").text_box)
+        self.assertNotIn("글자 위치도", app.status.get())
+
     def test_removal_settings_are_remembered(self):
         app = self.app
         app.method.set("action")
@@ -455,12 +498,48 @@ class AppTests(unittest.TestCase):
         self.assertEqual((options.adjust, options.adjust_name), (True, "필름"))
         log = window.log.get("1.0", "end")
         self.assertIn("지우기 + 보정)", log)
-        self.assertIn("완료  a.jpg → a_removed.jpg (가로 사진용 영역, 보정)", log)
+        # The text is looked for by default; a plain test photo has none, so the saved area was used.
+        self.assertIn("완료  a.jpg → a_removed.jpg (가로 사진용 영역, 글자 못 찾음: 저장된 위치, 보정)", log)
         self.assertTrue(settings.load_settings("batch")["adjust"])
         # Everything shown in the window also goes to today's log file.
         logs = list(settings.log_dir().glob("auto-*.log"))
         self.assertEqual(len(logs), 1)
         self.assertIn("완료  a.jpg → a_removed.jpg", logs[0].read_text(encoding="utf-8"))
+        window.close()
+
+    def test_batch_window_can_leave_the_text_alone(self):
+        folder = Path(self.tmp.name) / "사진"
+        folder.mkdir()
+        path = folder / "a.jpg"
+        Image.new("RGB", (800, 600)).save(path)
+        stamp = time.time() - 60
+        os.utime(path, (stamp, stamp))
+        area = shapes.Area([shapes.rect(700, 560, 790, 590)], (800, 600), "anchor", text_box=(705, 565, 785, 585))
+        settings.save_preset("워터마크", area)
+        self.app._refresh_presets()
+        self.app.open_batch_window()
+        window = self.app._batch_window
+        self.assertTrue(window.find_text.get())  # on unless switched off
+        self.assertIn("글자 위치 기억함", window.area_info.get())
+        window.find_text.set(False)
+        window.watch.set(False)
+        window.input_dir.set(str(folder))
+
+        def fake_remove(photo, area, output, options, **kwargs):
+            output.write_bytes(b"result")
+            return {"ok": True, "output": str(output), "warnings": []}
+
+        with mock.patch.object(gui.api, "remove_area", side_effect=fake_remove) as remove, \
+                mock.patch.object(gui.textfind, "place") as place:
+            window.start()
+            for _ in range(200):
+                self.pump(0.02)
+                if not window.running:
+                    break
+        place.assert_not_called()
+        self.assertIsInstance(remove.call_args.args[1], shapes.AreaSet)  # the saved area, as it is
+        self.assertIn("완료  a.jpg → a_removed.jpg\n", window.log.get("1.0", "end"))
+        self.assertFalse(settings.load_settings("batch")["find_text"])
         window.close()
 
     def test_watcher_restarts_itself_after_an_unexpected_error(self):
@@ -628,8 +707,8 @@ class WatchWindowTests(unittest.TestCase):
         self.assertEqual((options.method, options.expand, options.action_set, options.action_name),
                          ("action", 6, "내 동작", "지우기"))  # the action is the one set up in the main window
         self.assertEqual((options.adjust, options.adjust_set, options.adjust_name), (True, "내 보정", "필름"))
-        self.assertIn("완료  tall.jpg → tall_removed.jpg (세로 사진용 영역)", seen["log"])
-        self.assertIn("완료  wide.jpg → wide_removed.jpg (가로 사진용 영역)", seen["log"])
+        self.assertIn("완료  tall.jpg → tall_removed.jpg (세로 사진용 영역, 글자 못 찾음: 저장된 위치)", seen["log"])
+        self.assertIn("완료  wide.jpg → wide_removed.jpg (가로 사진용 영역, 글자 못 찾음: 저장된 위치)", seen["log"])
         self.assertEqual(sorted(p.name for p in (self.folder / "지운 사진").iterdir()),
                          ["tall_removed.jpg", "wide_removed.jpg"])
 

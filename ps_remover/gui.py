@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 import queue
@@ -15,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 from typing import Callable, List, Optional, Tuple
 
-from . import __version__, api, settings
+from . import __version__, api, settings, textfind
 from . import shapes as sh
 from .awake import KeepAwake
 from .batch import DEFAULT_OUTPUT_FOLDER, DEFAULT_WATCH_INTERVAL, BatchJob, BatchRunner
@@ -57,6 +58,9 @@ ADJUST_HINT = "보정: 지운 다음 녹화해 둔 보정 동작을 사진 전�
 ORIENTATION_HELP = ("가로 사진과 세로 사진에서 글씨 자리가 다르면, 다른 방향의 사진을 열어 그 사진에 맞게 그린 뒤 "
                     "같은 이름으로 한 번 더 저장하세요. 사진마다 방향에 맞는 영역을 알아서 고릅니다.")
 
+TEXTFIND_MISSING = ("글자를 찾으려면 numpy가 필요합니다. 이 프로그램을 닫고 run_windows.bat(macOS는 run_mac.command)을 "
+                    "다시 실행하면 저절로 설치됩니다.")
+
 BATCH_NO_PRESET = ("저장된 공통 영역이 없습니다. PS Remover 메인 창(run_windows.bat / run_mac.command)에서 "
                    "기준 사진을 열고 지울 영역을 그린 뒤 [지금 영역 저장...]으로 공통 영역을 만드세요.")
 
@@ -85,6 +89,8 @@ HELP_TEXT = """\
   폴더에 사진이 들어올 때마다 1초 안팎에 그 영역을 선택해 지우고 저장합니다.
   다음부터는 auto_windows.bat(macOS는 auto_mac.command)만 실행하면 바로 시작합니다.
   [이 사진에 적용]을 누르면 공통 영역이 지금 사진의 어디에 놓이는지 볼 수 있습니다.
+  [글자 찾아 적용]을 누르면 사진 오른쪽 아래의 글자를 찾아 그 자리에 영역을 놓습니다.
+  폴더 자동 처리도 사진마다 이렇게 글자를 찾아 맞추고, 못 찾으면 저장된 위치를 지웁니다.
 
 Photoshop 작업 표시줄의 [제거] 버튼으로 지우려면
   지우는 방식에서 'Photoshop [제거] 버튼'을 고르세요.
@@ -268,6 +274,7 @@ class RemoverApp:
         self.preset_box = ttk.Combobox(common, textvariable=self.preset, state="readonly", width=18)
         self.preset_box.pack(side=tk.LEFT)
         ttk.Button(common, text="이 사진에 적용", command=self.apply_preset).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(common, text="글자 찾아 적용", command=self.find_text_here).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(common, text="지금 영역 저장...", command=self.save_preset).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(common, text="삭제", command=self.delete_preset).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(common, text="폴더 자동 처리...", style="Accent.TButton",
@@ -699,7 +706,8 @@ class RemoverApp:
             warnings = error.result.get("warnings") or []
             if warnings:
                 text += "\n\n참고:\n" + "\n".join(f"- {w}" for w in warnings)
-        elif isinstance(error, (PhotoshopError, api.JobError, sh.SelectionError, OSError)):
+        elif isinstance(error, (PhotoshopError, api.JobError, sh.SelectionError, OSError,
+                                textfind.TextFindUnavailable)):
             text = str(error)
         else:
             text = f"예상하지 못한 오류가 났습니다: {error!r}"
@@ -784,6 +792,42 @@ class RemoverApp:
             other = sh.ORIENTATION_LABELS[next(iter(area_set.areas))]
             self.status.set(f"공통 영역 '{name}'에 {label}용 영역이 없어서 {other}용 영역을 맞춰 놓았습니다 "
                             f"({area.describe()}). 위치가 다르면 여기서 다시 그리고 같은 이름으로 저장하세요.")
+
+    def find_text_here(self) -> None:
+        """Put the area on the text found in this photo, the way the folder watcher does."""
+        if self._busy:
+            return
+        if self.photo_path is None or self.image_size is None:
+            messagebox.showinfo(APP_TITLE, "먼저 [사진 열기]로 사진을 고르세요.")
+            return
+        if not textfind.available():
+            messagebox.showinfo(APP_TITLE, TEXTFIND_MISSING)
+            return
+        name = self.preset.get()
+        try:
+            area = settings.load_preset(name) if name else None
+        except sh.SelectionError as exc:
+            messagebox.showerror(APP_TITLE, str(exc))
+            return
+        photo = self.photo_path
+        self._start("사진에서 글자를 찾는 중입니다...", lambda: {"placement": textfind.place(photo, area)},
+                    lambda result: self._text_found(result["placement"], name))
+
+    def _text_found(self, placement: "textfind.Placement", name: str) -> None:
+        found = placement.found
+        if found is None:
+            if placement.area is None:
+                self.status.set("오른쪽 아래에서 글자를 찾지 못했습니다. 지울 부분을 직접 그려 주세요.")
+                return
+            self.shapes = placement.area.on_photo(self.image_size)
+            self.status.set(f"글자를 찾지 못해서 공통 영역 '{name}'을(를) 저장된 위치에 놓았습니다. "
+                            "폴더 자동 처리에서도 이런 사진은 저장된 위치를 지웁니다.")
+        else:
+            self.shapes = list(placement.area.shapes)  # already in this photo's pixels
+            follow = f"공통 영역 '{name}'을(를) 글자에 맞춰 놓았습니다" if name else "글자 둘레를 지울 영역으로 놓았습니다"
+            self.status.set(f"글자를 찾았습니다 (가로 {found.width:.0f} x 세로 {found.height:.0f} px). {follow}. "
+                            "폴더 자동 처리도 사진마다 이렇게 합니다.")
+        self._schedule_render()
 
     def delete_preset(self) -> None:
         name = self.preset.get()
@@ -987,6 +1031,9 @@ class PresetDialog:
         anchor = next(key for key, text in sh.ANCHOR_LABELS.items() if text == self.anchor.get())
         try:
             area = sh.Area(list(self.app.shapes), self.app.image_size, fit, anchor if fit == "anchor" else None)
+            text_box = self._find_text_in(area)
+            if text_box:
+                area = dataclasses.replace(area, text_box=text_box)
             existing = settings.load_preset(existing_name) if existing_name else None
             if existing and self.orientation in existing.areas and not messagebox.askyesno(
                     "공통 영역 저장", f"'{name}'의 {label}용 영역을 새로 그린 영역으로 바꿀까요?", parent=self.window):
@@ -1004,8 +1051,19 @@ class PresetDialog:
             other = "세로" if self.orientation == "landscape" else "가로"
             done = (f"{other} 사진의 영역이 다르다면 {other} 사진을 열어 영역을 그리고 "
                     f"같은 이름으로 한 번 더 저장하세요.")
+        if text_box:
+            done = f"영역 안의 글자 위치도 기억해서, 다른 사진에서는 글자를 찾아 그만큼 떨어진 곳을 지웁니다. {done}"
         self.app.status.set(f"공통 영역 '{name}'의 {label}용 영역을 저장했습니다. {done}")
         self.window.destroy()
+
+    def _find_text_in(self, area: sh.Area) -> Optional[sh.Box]:
+        """Where the text is inside the drawn area, so other photos can be matched to it."""
+        if self.app.photo_path is None or not textfind.available():
+            return None
+        try:
+            return textfind.learn_text_box(self.app.photo_path, area)
+        except textfind.TextFindUnavailable:
+            return None
 
 
 class BatchWindow:
@@ -1041,6 +1099,7 @@ class BatchWindow:
             adjust = bool(app.adjust.get() if app else main.get("adjust", False))
         self.adjust = tk.BooleanVar(value=adjust)
         self.adjust_info = tk.StringVar()
+        self.find_text = tk.BooleanVar(value=saved.get("find_text", True))
         self.autostart = tk.BooleanVar(value=saved.get("autostart", True))
         self.login_start = tk.BooleanVar(value=settings.starts_at_login())
         self.area_info = tk.StringVar()
@@ -1106,6 +1165,8 @@ class BatchWindow:
 
         options = ttk.Frame(body)
         options.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(options, text="사진마다 오른쪽 아래 글자를 찾아서 영역을 맞추기 (추천)",
+                        variable=self.find_text).pack(anchor="w", pady=(0, 4))
         watch_row = ttk.Frame(options)
         watch_row.pack(anchor="w")
         ttk.Checkbutton(watch_row, text="새 사진이 들어오면 바로 지우기 (폴더 감시), 확인 간격",
@@ -1154,11 +1215,14 @@ class BatchWindow:
             self.area_info.set("읽을 수 없는 공통 영역입니다.")
             return
         if len(areas) == 2:
-            self.area_info.set("가로·세로 사진용 영역이 따로 있습니다.")
+            info = "가로·세로 사진용 영역이 따로 있습니다."
         else:
             this = next(iter(areas))
             other = "세로" if this == "landscape" else "가로"
-            self.area_info.set(f"{sh.ORIENTATION_LABELS[this]}용 영역만 있습니다 ({other} 사진에는 맞춰서 씁니다).")
+            info = f"{sh.ORIENTATION_LABELS[this]}용 영역만 있습니다 ({other} 사진에는 맞춰서 씁니다)."
+        if any(area.text_box for area in areas.values()):
+            info += " 글자 위치 기억함."
+        self.area_info.set(info)
 
     def _adjust_names(self) -> Tuple[str, str]:
         """The adjustment action set up in the main window."""
@@ -1231,7 +1295,8 @@ class BatchWindow:
                 options = self._options()
                 output = self.output_dir.get().strip()
                 job = BatchJob(Path(self.input_dir.get().strip()), settings.load_preset(self.preset.get()),
-                               Path(output) if output else None, options, skip_done=self.skip_done.get())
+                               Path(output) if output else None, options, skip_done=self.skip_done.get(),
+                               find_text=self.find_text.get())
             except (ValueError, sh.SelectionError) as exc:  # JobError is a ValueError
                 problem = str(exc)
         if problem is not None:
@@ -1246,7 +1311,10 @@ class BatchWindow:
         self._watching, self._user_stopped = watch, False
         mode = "새 사진이 들어오면 바로 처리" if watch else "지금 있는 사진만 처리"
         steps = "지우기 + 보정" if options.adjust else "지우기"
-        self._log(f"시작: {job.input_dir} → {job.output_dir} ('{self.preset.get()}', {mode}, {steps})")
+        where = ", 글자 찾아 맞춤" if job.find_text else ""
+        self._log(f"시작: {job.input_dir} → {job.output_dir} ('{self.preset.get()}'{where}, {mode}, {steps})")
+        if job.find_text and not textfind.available():
+            self._log("참고: " + TEXTFIND_MISSING + " 그전까지는 저장된 위치를 지웁니다.")
         if watch and self._awake.start():
             self._log("자동 처리 중에는 컴퓨터가 절전 모드로 들어가지 않습니다. (화면은 꺼질 수 있습니다)")
         self._set_running(True)
@@ -1314,6 +1382,8 @@ class BatchWindow:
             result = event["result"]
             used = result.get("areaUsed")
             notes = [f"{sh.ORIENTATION_LABELS[used]}용 영역"] if used in sh.ORIENTATION_LABELS else []
+            if result.get("textNote"):
+                notes.append(result["textNote"])
             if result.get("adjustSteps"):
                 notes.append("보정")
             which = f" ({', '.join(notes)})" if notes else ""
@@ -1386,7 +1456,8 @@ class BatchWindow:
             settings.save_settings("batch", {
                 "preset": self.preset.get(), "input_dir": self.input_dir.get().strip(),
                 "output_dir": self.output_dir.get().strip(), "method": self.method.get(),
-                "expand": self.expand.get(), "adjust": self.adjust.get(), "skip_done": self.skip_done.get(),
+                "expand": self.expand.get(), "adjust": self.adjust.get(), "find_text": self.find_text.get(),
+                "skip_done": self.skip_done.get(),
                 "watch": self.watch.get(), "interval": self.interval.get(), "autostart": self.autostart.get(),
             })
         except OSError:

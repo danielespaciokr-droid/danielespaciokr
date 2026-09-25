@@ -198,12 +198,16 @@ class Area:
                    the shorter sides. A watermark in the bottom-right corner stays
                    there on a portrait photo too.
     fit "stretch": scale each axis to the photo's size.
+
+    ``text_box`` is where the text to remove was on that photo, if known: the
+    area can then follow the text on other photos (see ps_remover.textfind).
     """
 
     shapes: List[Shape]
     image_size: Optional[Tuple[int, int]] = None
     fit: str = "exact"
     anchor: Optional[Tuple[float, float]] = None
+    text_box: Optional[Box] = None
 
     def __post_init__(self) -> None:
         self.shapes = list(self.shapes)
@@ -223,6 +227,11 @@ class Area:
             if not (0 <= ax <= 1 and 0 <= ay <= 1):
                 raise SelectionError("anchor 값은 0~1 사이여야 합니다.")
             self.anchor = (ax, ay)
+        if self.text_box is not None:
+            left, top, right, bottom = (_number(v) for v in self.text_box)
+            if right <= left or bottom <= top:
+                raise SelectionError("text_box는 [왼쪽, 위, 오른쪽, 아래] 형식이어야 합니다.")
+            self.text_box = (left, top, right, bottom)
 
     def on_photo(self, size: Tuple[int, int]) -> List[Shape]:
         """The shapes placed on a photo of ``size`` (width, height)."""
@@ -247,6 +256,8 @@ class Area:
         }
         if self.anchor is not None:
             data["anchor"] = [self.anchor[0], self.anchor[1]]
+        if self.text_box is not None:
+            data["text_box"] = [_r(v) for v in self.text_box]
         data["shapes"] = [shape.to_dict() for shape in self.shapes]
         return data
 
@@ -262,11 +273,15 @@ class Area:
         anchor = data.get("anchor")
         if anchor is not None and (not isinstance(anchor, (list, tuple)) or len(anchor) != 2):
             raise SelectionError("anchor는 [x, y] 형식이어야 합니다.")
+        text_box = data.get("text_box")
+        if text_box is not None and (not isinstance(text_box, (list, tuple)) or len(text_box) != 4):
+            raise SelectionError("text_box는 [왼쪽, 위, 오른쪽, 아래] 형식이어야 합니다.")
         return cls(
             [Shape.from_dict(item) for item in data["shapes"]],
             tuple(size) if size is not None else None,
             data.get("fit", "exact"),
             tuple(anchor) if anchor is not None else None,
+            tuple(text_box) if text_box is not None else None,
         )
 
 

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ps_remover import api, batch, shapes
+from ps_remover import api, batch, shapes, textfind
 from ps_remover.photoshop import PhotoshopError, PhotoshopNotFound, ScriptFailed
 
 AREA = shapes.Area([shapes.rect(0, 0, 10, 10)], (100, 100), "anchor")
@@ -352,6 +352,51 @@ class BatchRunnerTests(BatchTestCase):
             runner, events, _ = self.run_until_done(job, remove)
         self.assertIn("저장 폴더를 만들 수 없습니다", [e for e in events if e["type"] == "error"][0]["error"])
         self.assertEqual(runner.done, 1)
+
+    def test_finding_the_text_moves_the_area_for_each_photo(self):
+        self.photo("a.jpg")
+        self.photo("b.jpg")
+        moved = shapes.Area([shapes.rect(80, 90, 99, 99)], (100, 100))
+        seen = []
+
+        def locate(photo, area):
+            seen.append((photo.name, area))
+            if photo.name == "a.jpg":
+                return textfind.Placement(moved, textfind.FoundText((82, 92, 97, 97), 4.0, 0.9), "글자 찾음")
+            return textfind.Placement(AREA, None, "글자 못 찾음: 저장된 위치")
+
+        remove = FakeRemove()
+        events = []
+        batch.BatchRunner(self.job(find_text=True), events.append, remove=remove, locate=locate).run()
+        self.assertEqual([(name, area) for name, area in seen], [("a.jpg", AREA), ("b.jpg", AREA)])
+        self.assertEqual([c["area"] for c in remove.calls], [moved, AREA])  # not found: as saved
+        notes = [e["result"].get("textNote") for e in events if e["type"] == "done"]
+        self.assertEqual(notes, ["글자 찾음", "글자 못 찾음: 저장된 위치"])
+
+    def test_trouble_finding_the_text_falls_back_to_the_saved_area(self):
+        self.photo("a.jpg")
+        self.photo("b.jpg")
+        failures = {"a.jpg": textfind.TextFindUnavailable("numpy가 필요합니다"), "b.jpg": ValueError("boom")}
+
+        def locate(photo, area):
+            raise failures[photo.name]
+
+        remove = FakeRemove()
+        events = []
+        batch.BatchRunner(self.job(find_text=True), events.append, remove=remove, locate=locate).run()
+        self.assertEqual([c["area"] for c in remove.calls], [AREA, AREA])
+        notes = [e["result"]["textNote"] for e in events if e["type"] == "done"]
+        self.assertEqual(notes[0], "글자 찾기 못 함: numpy가 필요합니다")
+        self.assertIn("글자 찾기 오류", notes[1])
+
+    def test_text_is_not_looked_for_unless_asked(self):
+        self.photo("a.jpg")
+        locate = mock.Mock()
+        remove = FakeRemove()
+        events = []
+        batch.BatchRunner(self.job(), events.append, remove=remove, locate=locate).run()
+        locate.assert_not_called()
+        self.assertNotIn("textNote", [e for e in events if e["type"] == "done"][0]["result"])
 
     def test_stop_before_next_photo(self):
         for name in ("a.jpg", "b.jpg", "c.jpg"):

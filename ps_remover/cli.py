@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from . import __version__, api
+from . import __version__, api, textfind
 from .batch import DEFAULT_OUTPUT_FOLDER, DEFAULT_WATCH_INTERVAL, BatchJob, BatchRunner
 from .photoshop import PhotoshopError, ScriptFailed
 from .settings import check_preset_name, delete_preset, list_presets, load_preset, presets_dir
@@ -28,6 +28,8 @@ EPILOG = """\
   ps-remover batch 사진폴더 --preset 워터마크 --watch   새 사진이 들어올 때마다 계속 지우기
   ps-remover batch 사진폴더 --preset 워터마크 --watch --adjust
                                                         지운 뒤 녹화해 둔 보정 동작(Camera Raw 필터 등)까지 적용
+  ps-remover batch 사진폴더 --preset 워터마크 --watch --find-text
+                                                        사진마다 오른쪽 아래 글자를 찾아 영역을 맞추기
   ps-remover watch                                      폴더 자동 처리 창만 열기 (저장된 설정으로 바로 시작)
   ps-remover presets                                    저장된 공통 영역 보기
   ps-remover remove 사진.jpg --rect 120,80,300,200 --method action
@@ -68,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "좌표는 사진의 픽셀 단위이며 (0,0)은 왼쪽 위입니다.",
     )
     remove.add_argument("photos", nargs="+", metavar="사진", help="처리할 사진 (여러 개 가능)")
-    _add_area_options(remove)
+    _add_area_options(remove, find_text=True)
     _add_removal_options(remove)
     out = remove.add_argument_group("저장")
     out.add_argument("-o", "--output", help="결과 파일 경로 (사진이 하나일 때만). 기본값: 사진이름_removed.확장자")
@@ -92,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "--watch를 쓰면 폴더를 계속 지켜보다가 새 사진이 들어오는 대로 지웁니다.",
     )
     batch.add_argument("folder", metavar="폴더", help="사진이 들어 있는 폴더")
-    _add_area_options(batch)
+    _add_area_options(batch, find_text=True)
     _add_removal_options(batch)
     group = batch.add_argument_group("저장과 반복")
     group.add_argument("--output-dir", help=f"결과를 저장할 폴더 (기본값: 폴더/{DEFAULT_OUTPUT_FOLDER})")
@@ -143,7 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _add_area_options(parser: argparse.ArgumentParser, subject: bool = True) -> None:
+def _add_area_options(parser: argparse.ArgumentParser, subject: bool = True, find_text: bool = False) -> None:
     area = parser.add_argument_group("지울 영역")
     area.add_argument("--preset", metavar="이름", help="GUI에서 저장한 공통 영역 (ps-remover presets로 목록 보기)")
     area.add_argument("--selection", metavar="파일.json", help="선택 영역 파일")
@@ -154,6 +156,9 @@ def _add_area_options(parser: argparse.ArgumentParser, subject: bool = True) -> 
     if subject:
         area.add_argument("--subject", action="store_true",
                           help="Photoshop '피사체 선택' 사용. 영역을 함께 주면 그 안의 피사체만 지움 (CC 2018 이상)")
+    if find_text:
+        area.add_argument("--find-text", action="store_true",
+                          help="사진마다 오른쪽 아래 글자를 찾아 영역을 그 글자에 맞춤 (못 찾으면 저장된 위치)")
 
 
 def _add_removal_options(parser: argparse.ArgumentParser, adjust: bool = True) -> None:
@@ -228,7 +233,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 def _cmd_remove(args) -> int:
-    area = _collect_area(args)
+    area = _collect_area(args, required=not args.find_text)
     options = _removal_options(args)
     photos = _expand_photos(args.photos)
     if args.output and len(photos) > 1:
@@ -251,8 +256,13 @@ def _cmd_remove(args) -> int:
     for index, photo in enumerate(photos):
         try:
             output = _output_for(photo, args, options)
-            result = api.remove_area(photo, area, output, options, overwrite=args.overwrite,
+            photo_area, note = _area_on(photo, area) if args.find_text else (area, None)
+            if photo_area is None:
+                raise api.JobError("오른쪽 아래에서 글자를 찾지 못했습니다. 지울 영역을 --preset 등으로 함께 주세요.")
+            result = api.remove_area(photo, photo_area, output, options, overwrite=args.overwrite,
                                      photoshop=args.photoshop, timeout=args.timeout)
+            if note:
+                result = dict(result, textNote=note)
         except ScriptFailed as exc:
             failures += 1
             _report_failure(args, photo, str(exc), exc.result)
@@ -275,7 +285,7 @@ def _cmd_remove(args) -> int:
 def _cmd_batch(args) -> int:
     job = BatchJob(
         Path(args.folder), _collect_area(args), Path(args.output_dir) if args.output_dir else None,
-        _removal_options(args), suffix=args.suffix, skip_done=not args.reprocess,
+        _removal_options(args), suffix=args.suffix, skip_done=not args.reprocess, find_text=args.find_text,
         photoshop=args.photoshop, timeout=args.timeout,
     )
     report = _BatchReport(args)
@@ -308,7 +318,8 @@ class _BatchReport:
         if kind == "start":
             print(f"[{event['index'] + 1}/{event['count']}] {event['photo'].name}", flush=True)
         elif kind == "done":
-            print(f"    완료 → {event['result'].get('output')}{_warnings_text(event['result'], '    ')}", flush=True)
+            note = f" ({event['result']['textNote']})" if event["result"].get("textNote") else ""
+            print(f"    완료 → {event['result'].get('output')}{note}{_warnings_text(event['result'], '    ')}", flush=True)
         elif kind == "failed":
             _error(f"{event['photo'].name}: {event['error']}")
         elif kind == "error":
@@ -439,6 +450,15 @@ def _collect_area(args, required: bool = True):
     return area
 
 
+def _area_on(photo: Path, area):
+    """``area`` moved onto the text found in ``photo``, and a note on it."""
+    try:
+        placement = textfind.place(photo, area if area_has_shapes(area) else None)
+    except textfind.TextFindUnavailable as exc:
+        return (area if area_has_shapes(area) else None), f"글자 찾기 못 함: {exc}"
+    return placement.area, placement.note
+
+
 def _removal_options(args) -> api.RemoveOptions:
     options = api.RemoveOptions(
         method=args.method,
@@ -465,6 +485,8 @@ def _output_for(photo: Path, args, options: api.RemoveOptions) -> Path:
 
 def _success_text(photo: Path, result: dict) -> str:
     text = f"완료: {photo} → {result.get('output')}"
+    if result.get("textNote"):
+        text += f" ({result['textNote']})"
     bounds = result.get("selectionBounds")
     if bounds:
         left, top, right, bottom = (round(v) for v in bounds)

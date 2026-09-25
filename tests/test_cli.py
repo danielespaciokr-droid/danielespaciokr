@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ps_remover import cli, settings, shapes
+from ps_remover import cli, settings, shapes, textfind
 from ps_remover.photoshop import PhotoshopNotFound, ScriptFailed
 
 
@@ -265,6 +265,51 @@ class CliTests(unittest.TestCase):
         self.assertIn("보정에 쓸 Photoshop 동작", err)
         with self.assertRaises(SystemExit):  # removing the current selection does not adjust
             run(["remove-selection", "--adjust"])
+
+    def test_find_text(self):
+        found = textfind.FoundText((1, 1, 4, 4), 3.0, 0.9)
+        moved = shapes.Area([shapes.rect(0, 0, 5, 5)], (10, 10))
+        with mock.patch("ps_remover.textfind.place", return_value=textfind.Placement(moved, found, "글자 찾음")) as place, \
+                mock.patch("ps_remover.api.remove_area", return_value={"ok": True, "output": "x"}) as remove:
+            code, out, err = run(["remove", str(self.photo), "--find-text"])
+            self.assertEqual(code, 0, err)
+            self.assertIsNone(place.call_args.args[1])  # no area given: look near the bottom-right corner
+            self.assertIs(remove.call_args.args[1], moved)
+            self.assertIn("(글자 찾음)", out)
+            settings.save_preset("워터마크", shapes.Area([shapes.rect(0, 0, 10, 10)], (100, 100), "anchor"))
+            run(["remove", str(self.photo), "--preset", "워터마크", "--find-text"])
+            self.assertEqual(set(place.call_args.args[1].areas), {"landscape"})
+        missed = textfind.Placement(None, None, "글자 못 찾음")
+        with mock.patch("ps_remover.textfind.place", return_value=missed), \
+                mock.patch("ps_remover.api.remove_area") as remove:
+            code, _, err = run(["remove", str(self.photo), "--find-text"])
+        self.assertEqual(code, 1)
+        self.assertIn("글자를 찾지 못했습니다", err)
+        remove.assert_not_called()
+        with self.assertRaises(SystemExit):  # nothing to find in Photoshop's current selection
+            run(["remove-selection", "--find-text"])
+
+    def test_batch_find_text(self):
+        folder = self.dir / "사진"
+        folder.mkdir()
+        path = folder / "a.jpg"
+        path.write_bytes(b"jpeg")
+        stamp = time.time() - 60
+        os.utime(path, (stamp, stamp))
+        settings.save_preset("워터마크", shapes.Area([shapes.rect(0, 0, 10, 10)], (100, 100), "anchor"))
+        found = textfind.FoundText((1, 1, 4, 4), 3.0, 0.9)
+        moved = shapes.Area([shapes.rect(0, 0, 5, 5)], (10, 10))
+
+        def fake_remove(photo, area, output, options, **kwargs):
+            output.write_bytes(b"result")
+            return {"ok": True, "output": str(output), "warnings": []}
+
+        with mock.patch("ps_remover.textfind.place", return_value=textfind.Placement(moved, found, "글자 찾음")), \
+                mock.patch("ps_remover.api.remove_area", side_effect=fake_remove) as remove:
+            code, out, err = run(["batch", str(folder), "--preset", "워터마크", "--find-text"])
+        self.assertEqual(code, 0, err)
+        self.assertIs(remove.call_args.args[1], moved)
+        self.assertIn("(글자 찾음)", out)
 
     def test_batch_errors(self):
         code, _, err = run(["batch", str(self.dir / "없는폴더"), "--rect", "0,0,5,5"])

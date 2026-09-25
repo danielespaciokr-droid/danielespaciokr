@@ -11,12 +11,15 @@ def fake_find_spec(available):
 
 class LauncherTests(unittest.TestCase):
     def test_missing_packages(self):
-        with mock.patch.object(launcher.importlib.util, "find_spec", fake_find_spec({"PIL"})), \
+        with mock.patch.object(launcher.importlib.util, "find_spec", fake_find_spec({"PIL", "numpy"})), \
                 mock.patch.object(launcher.sys, "platform", "win32"):
             self.assertEqual(launcher.missing_packages(), ["pywin32"])
+        with mock.patch.object(launcher.importlib.util, "find_spec", fake_find_spec({"PIL", "win32com"})), \
+                mock.patch.object(launcher.sys, "platform", "win32"):
+            self.assertEqual(launcher.missing_packages(), ["numpy"])  # added later: installed on the next start
         with mock.patch.object(launcher.importlib.util, "find_spec", fake_find_spec(set())), \
                 mock.patch.object(launcher.sys, "platform", "darwin"):
-            self.assertEqual(launcher.missing_packages(), ["Pillow"])
+            self.assertEqual(launcher.missing_packages(), ["Pillow", "numpy"])
 
     def test_install_command(self):
         with mock.patch.object(launcher.sys, "prefix", "/base"), mock.patch.object(launcher.sys, "base_prefix", "/base"):

@@ -1,6 +1,6 @@
 """What run_windows.bat and run_mac.command start.
 
-Installs the packages the program needs the first time (Pillow, plus pywin32
+Installs the packages the program needs the first time (Pillow and numpy, plus pywin32
 on Windows), then opens it. Problems are explained in plain Korean, because
 the people double-clicking a launcher are usually not programmers.
 """
@@ -30,6 +30,8 @@ def missing_packages() -> List[str]:
     missing = []
     if importlib.util.find_spec("PIL") is None:
         missing.append("Pillow")
+    if importlib.util.find_spec("numpy") is None:  # finding the text in photos
+        missing.append("numpy")
     if sys.platform == "win32" and importlib.util.find_spec("win32com") is None:
         missing.append("pywin32")
     return missing
