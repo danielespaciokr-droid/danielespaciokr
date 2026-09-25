@@ -1,4 +1,5 @@
 Pillow>=8.0
 pywin32>=300; sys_platform == "win32"
-# 아이폰 HEIC 사진을 미리 보려면 아래 줄의 # 를 지우세요.
+# Optional: preview iPhone HEIC photos (remove the leading "# " to install it).
+# Keep this file ASCII-only: older pip versions read it with the Windows code page.
 # pillow-heif>=0.10
