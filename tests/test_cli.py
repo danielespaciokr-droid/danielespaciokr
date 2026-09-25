@@ -47,6 +47,41 @@ class CliTests(unittest.TestCase):
         self.assertIn("208x208", out)
         self.assertIn("참고: w", out)
 
+    def test_action_method(self):
+        with mock.patch("ps_remover.api.remove_area", return_value={"ok": True, "output": "o"}) as remove:
+            code, _, err = run(["remove", str(self.photo), "--rect", "0,0,5,5", "--method", "action"])
+        self.assertEqual(code, 0, err)
+        options = remove.call_args.args[3]
+        self.assertEqual((options.method, options.action_set, options.action_name), ("action", "ps-remover", "제거"))
+        with mock.patch("ps_remover.api.remove_current_selection", return_value={"ok": True}) as current:
+            run(["remove-selection", "--method", "action", "--action-set", "내 세트", "--action", "지우기"])
+        options = current.call_args.args[0]
+        self.assertEqual((options.action_set, options.action_name), ("내 세트", "지우기"))
+
+    def test_check_action(self):
+        found = {"setFound": True, "found": True, "stepCount": 1, "steps": ["제거"]}
+        with mock.patch("ps_remover.api.find_recorded_action", return_value=found) as find:
+            code, out, _ = run(["check-action"])
+        self.assertEqual(code, 0)
+        self.assertEqual(find.call_args.args, ("ps-remover", "제거"))
+        self.assertIn("녹화된 단계: 제거", out)
+        missing = {"setFound": False, "found": False, "stepCount": None, "steps": []}
+        for info, message in (
+            (missing, "세트가 없습니다"),
+            (dict(missing, setFound=True), "동작이 없습니다"),
+            (dict(missing, setFound=True, found=True, stepCount=0), "단계가 없습니다"),
+        ):
+            with self.subTest(message=message), \
+                    mock.patch("ps_remover.api.find_recorded_action", return_value=info):
+                code, out, _ = run(["check-action"])
+            self.assertEqual(code, 1)
+            self.assertIn(message, out)
+            self.assertIn("[기록]", out)  # setup instructions
+        with mock.patch("ps_remover.api.find_recorded_action", return_value=missing):
+            code, out, _ = run(["check-action", "--json"])
+        self.assertEqual(code, 1)
+        self.assertFalse(json.loads(out)["ok"])
+
     def test_selection_file_and_batch(self):
         selection = self.dir / "sel.json"
         shapes.save_selection(selection, [shapes.rect(0, 0, 10, 10)], (640, 480))

@@ -34,6 +34,19 @@ EDGE = (255, 230, 0)
 PREVIEW_MAX_SIDE = 2400  # longest side of the in-memory preview
 MAX_ZOOM = 8.0
 
+METHOD_HINTS = {
+    "content-aware": "내용 인식 채우기: 주변 내용으로 자연스럽게 채웁니다.",
+    "action": "Photoshop [제거] 버튼: 영역을 선택한 뒤 녹화해 둔 동작으로 [제거] 버튼과 같은 작업을 합니다. "
+              "처음이면 [설정...]을 보세요.",
+    "transparent": "투명하게 잘라내기: 선택한 부분을 투명하게 지우고 PNG로 저장합니다.",
+}
+
+ACTION_INTRO = (
+    "Photoshop에는 작업 표시줄의 버튼을 스크립트로 누르는 기능이 없습니다. 대신 [제거] 버튼을 누르는 과정을 "
+    "Photoshop '동작'으로 한 번 녹화해 두면, 이 도구가 영역을 선택한 뒤 그 동작을 실행합니다. "
+    "[제거] 버튼 대신 생성형 채우기 등 다른 작업을 녹화해도 됩니다."
+)
+
 HELP_TEXT = """\
 1. [사진 열기]로 사진을 고릅니다.
 2. 도구를 골라 사진 위에 지울 부분을 표시합니다.
@@ -45,6 +58,10 @@ HELP_TEXT = """\
 3. [Photoshop에서 지우기]를 누르면 Photoshop이 실행되어 사진을 열고,
    같은 영역을 선택해 지운 다음 결과를 새 파일로 저장합니다.
    원본 사진은 바뀌지 않습니다.
+
+Photoshop 작업 표시줄의 [제거] 버튼으로 지우려면
+  지우는 방식에서 'Photoshop [제거] 버튼'을 고르세요.
+  처음 한 번은 [설정...]의 안내대로 [제거] 버튼 누르기를 동작으로 녹화해야 합니다.
 
 Photoshop의 선택 도구로 직접 고르고 싶다면
   ① [Photoshop에서 열기]로 사진을 연 뒤 Photoshop에서 지울 부분을 선택하고
@@ -78,6 +95,10 @@ class RemoverApp:
         self.brush_size = tk.DoubleVar(value=40)
         self.brush_label = tk.StringVar(value="40 px")
         self.method = tk.StringVar(value="content-aware")
+        self.action_set = tk.StringVar(value=api.DEFAULT_ACTION_SET)
+        self.action_name = tk.StringVar(value=api.DEFAULT_ACTION_NAME)
+        self.action_status = tk.StringVar()
+        self._action_dialog: Optional[tk.Toplevel] = None
         self.expand = tk.StringVar(value="4")
         self.feather = tk.StringVar(value="0")
         self.subject = tk.BooleanVar(value=False)
@@ -159,9 +180,12 @@ class RemoverApp:
         ttk.Label(panel, text="지우는 방식").grid(row=0, column=0, sticky="w", padx=(0, 10))
         methods = ttk.Frame(panel)
         methods.grid(row=0, column=1, columnspan=3, sticky="w")
-        ttk.Radiobutton(methods, text="내용 인식 채우기 (주변과 자연스럽게 채움)", value="content-aware",
+        ttk.Radiobutton(methods, text="내용 인식 채우기", value="content-aware",
                         variable=self.method).pack(side=tk.LEFT)
-        ttk.Radiobutton(methods, text="투명하게 잘라내기 (PNG로 저장)", value="transparent",
+        ttk.Radiobutton(methods, text="Photoshop [제거] 버튼", value="action",
+                        variable=self.method).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Button(methods, text="설정...", command=self.open_action_settings).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Radiobutton(methods, text="투명하게 잘라내기 (PNG)", value="transparent",
                         variable=self.method).pack(side=tk.LEFT, padx=(16, 0))
 
         ttk.Label(panel, text="선택 다듬기").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(6, 0))
@@ -419,9 +443,11 @@ class RemoverApp:
             self._output_auto = False
 
     def _on_method_change(self) -> None:
+        method = self.method.get()
+        self.status.set(METHOD_HINTS.get(method, ""))
         if self.photo_path and self._output_auto:
-            self._set_output(api.default_output_path(self.photo_path, self.method.get()), auto=True)
-        elif self.method.get() == "transparent" and self.output.get().lower().endswith((".jpg", ".jpeg")):
+            self._set_output(api.default_output_path(self.photo_path, method), auto=True)
+        elif method == "transparent" and self.output.get().lower().endswith((".jpg", ".jpeg")):
             self.status.set("JPG는 투명도를 저장할 수 없습니다. 투명하게 남기려면 저장 위치를 .png로 바꾸세요.")
 
     def choose_output(self) -> None:
@@ -470,6 +496,8 @@ class RemoverApp:
         try:
             options = api.RemoveOptions(
                 method=self.method.get(),
+                action_set=self.action_set.get().strip(),
+                action_name=self.action_name.get().strip(),
                 expand=int(float(self.expand.get() or 0)),
                 feather=float(self.feather.get() or 0),
                 subject=self.subject.get(),
@@ -593,6 +621,63 @@ class RemoverApp:
             text = f"예상하지 못한 오류가 났습니다: {error!r}"
         self.status.set("실패: " + text.splitlines()[0])
         messagebox.showerror(APP_TITLE, text)
+
+    # ------------------------------------------------------ recorded action
+
+    def open_action_settings(self) -> None:
+        """Explain how to record the Remove button as an action, and check for it."""
+        if self._action_dialog is not None and self._action_dialog.winfo_exists():
+            self._action_dialog.lift()
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Photoshop [제거] 버튼 쓰기")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        self._action_dialog = dialog
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text=ACTION_INTRO, justify="left", wraplength=560).grid(
+            row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(body, text=api.ACTION_SETUP_HELP, justify="left", wraplength=560).grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(10, 12))
+        ttk.Label(body, text="세트 이름").grid(row=2, column=0, sticky="w")
+        ttk.Entry(body, textvariable=self.action_set, width=18).grid(row=2, column=1, sticky="w", padx=(6, 16))
+        ttk.Label(body, text="동작 이름").grid(row=2, column=2, sticky="w")
+        ttk.Entry(body, textvariable=self.action_name, width=18).grid(row=2, column=3, sticky="w", padx=(6, 0))
+        buttons = ttk.Frame(body)
+        buttons.grid(row=3, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        ttk.Button(buttons, text="Photoshop에서 확인", command=self.check_action).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="닫기", command=dialog.destroy).pack(side=tk.LEFT, padx=(6, 0))
+        self.action_status.set("")
+        ttk.Label(body, textvariable=self.action_status, justify="left", wraplength=560).grid(
+            row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
+    def check_action(self) -> None:
+        if self._busy:
+            return
+        action_set, action_name = self.action_set.get().strip(), self.action_name.get().strip()
+        if not action_set or not action_name:
+            self.action_status.set("세트 이름과 동작 이름을 입력하세요.")
+            return
+        self.action_status.set("Photoshop에서 동작을 찾는 중입니다...")
+        self._start("Photoshop에서 동작을 찾는 중입니다...",
+                    lambda: api.find_recorded_action(action_set, action_name),
+                    lambda info: self._action_checked(action_set, action_name, info))
+
+    def _action_checked(self, action_set: str, action_name: str, info: dict) -> None:
+        label = f"'{action_set} > {action_name}'"
+        if info.get("found") and info.get("stepCount") != 0:
+            steps = ", ".join(info.get("steps") or []) or "(알 수 없음)"
+            text = f"동작 {label}을(를) 찾았습니다. 녹화된 단계: {steps}"
+            self.method.set("action")
+        elif info.get("found"):
+            text = f"동작 {label}에 녹화된 단계가 없습니다. 다시 녹화하세요."
+        elif info.get("setFound"):
+            text = f"'{action_set}' 세트는 있지만 '{action_name}' 동작이 없습니다."
+        else:
+            text = f"Photoshop에 '{action_set}' 세트가 없습니다. 위 방법대로 녹화하세요."
+        self.action_status.set(text)
+        self.status.set(text)
 
     # ------------------------------------------------------ selection files
 

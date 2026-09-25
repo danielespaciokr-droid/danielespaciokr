@@ -164,6 +164,44 @@ class AppTests(unittest.TestCase):
         self.assertEqual(kwargs, {"image_size": (800, 600), "overwrite": False})
         self.assertIn("완료", self.app.status.get())
 
+    def test_action_method_and_settings_dialog(self):
+        app = self.app
+        app.method.set("action")
+        self.assertIn("[설정...]", app.status.get())
+        app.open_action_settings()
+        self.pump(0.1)
+        self.assertTrue(app._action_dialog.winfo_exists())
+        app.action_name.set("  지우기 ")
+        self.drag((100, 100), (300, 200))
+        with mock.patch.object(gui.api, "remove_area", return_value={"ok": True, "output": "x"}) as remove:
+            app.run_remove()
+            self.wait_idle()
+        options = remove.call_args.args[3]
+        self.assertEqual((options.method, options.action_set, options.action_name), ("action", "ps-remover", "지우기"))
+
+    def test_check_action_reports_into_dialog(self):
+        app = self.app
+        app.open_action_settings()
+        info = {"setFound": True, "found": True, "stepCount": 1, "steps": ["제거"]}
+        with mock.patch.object(gui.api, "find_recorded_action", return_value=info) as find:
+            app.check_action()
+            self.wait_idle()
+        self.assertEqual(find.call_args.args, ("ps-remover", "제거"))
+        self.assertIn("녹화된 단계: 제거", app.action_status.get())
+        self.assertEqual(app.method.get(), "action")  # a working action is selected for the user
+        missing = {"setFound": False, "found": False, "stepCount": None, "steps": []}
+        with mock.patch.object(gui.api, "find_recorded_action", return_value=missing):
+            app.check_action()
+            self.wait_idle()
+        self.assertIn("세트가 없습니다", app.action_status.get())
+
+    def wait_idle(self):
+        for _ in range(100):
+            self.pump(0.05)
+            if not self.app._busy:
+                return
+        self.fail("job did not finish")
+
     def test_output_follows_method_until_edited(self):
         app = self.app
         self.assertTrue(app.output.get().endswith("photo_removed.jpg"))

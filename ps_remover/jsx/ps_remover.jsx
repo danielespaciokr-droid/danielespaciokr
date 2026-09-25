@@ -10,6 +10,10 @@
  * Without a config (File > Scripts > Browse...) it removes the current
  * selection of the active document with content-aware fill.
  *
+ * Photoshop has no scripting command for the Contextual Task Bar's Remove
+ * button, so method "action" plays an Action in which the user recorded a
+ * click on that button (or any other removal they prefer).
+ *
  * ExtendScript implements ECMAScript 3: there is no JSON object, no
  * Array.prototype.forEach/map/indexOf, no String.prototype.trim, and reserved
  * words cannot be used as property names.
@@ -18,13 +22,15 @@
 var PSR_CONFIG = /*PSR_CONFIG*/null;
 
 var PSR_DEFAULTS = {
-    action: "remove_current",   // "remove" | "open" | "remove_current"
+    action: "remove_current",   // "remove" | "open" | "remove_current" | "find_action"
     input: null,                // photo to open ("remove", "open")
     output: null,               // file to save the result to
     ops: [],                    // selection shapes, see psrSelectShape()
     subject: false,             // keep only what Select > Subject finds inside the shapes
     expectedSize: null,         // [width, height] the shapes were drawn against
-    method: "content-aware",    // "content-aware" | "transparent"
+    method: "content-aware",    // "content-aware" | "action" | "transparent"
+    actionSet: "ps-remover",    // method "action": the recorded Photoshop action to play,
+    actionName: "제거",          // e.g. a click on the Contextual Task Bar's Remove button
     expand: 4,                  // grow the selection by this many pixels first
     feather: 0,                 // feather radius in pixels
     keepOpen: true,             // show the result in Photoshop afterwards
@@ -56,6 +62,8 @@ function psrRun(rawConfig) {
             psrActionOpen(cfg, result);
         } else if (cfg.action == "remove_current") {
             psrActionRemoveCurrent(cfg, result);
+        } else if (cfg.action == "find_action") {
+            result.recordedAction = psrFindRecordedAction(cfg.actionSet, cfg.actionName);
         } else {
             throw psrError("알 수 없는 작업입니다: " + cfg.action);
         }
@@ -94,7 +102,7 @@ function psrActionRemove(cfg, result, job) {
         psrBuildSelection(doc, psrScaleOps(cfg.ops, scale), cfg.subject, result);
         psrRefineSelection(doc, cfg);
         result.selectionBounds = psrSelectionBounds(doc);
-        psrRemoveSelected(doc, cfg.method);
+        psrRemoveSelected(doc, cfg, result);
     });
 
     var saved = psrSave(doc, cfg.output, cfg, result);
@@ -130,12 +138,12 @@ function psrActionRemoveCurrent(cfg, result) {
     if (!psrHasSelection(doc)) {
         throw psrError("Photoshop에 선택 영역이 없습니다. 선택 도구로 지울 부분을 먼저 선택하세요.");
     }
-    psrCheckEditable(doc, cfg.method);
+    if (cfg.method != "action") psrCheckEditable(doc, cfg.method); // a recorded action checks for itself
     psrInHistory(doc, PSR_HISTORY_NAME, function () {
         psrAtPixelResolution(doc, function () {
             psrRefineSelection(doc, cfg);
             result.selectionBounds = psrSelectionBounds(doc);
-            psrRemoveSelected(doc, cfg.method);
+            psrRemoveSelected(doc, cfg, result);
         });
     });
     if (cfg.output) {
@@ -428,13 +436,16 @@ function psrSelectionBounds(doc) {
 
 // ------------------------------------------------------------------ removal
 
-function psrRemoveSelected(doc, method) {
+function psrRemoveSelected(doc, cfg, result) {
+    var method = cfg.method;
     if (method == "transparent") {
         var layer = doc.activeLayer;
         if (layer.isBackgroundLayer) layer.isBackgroundLayer = false;
         doc.selection.clear();
     } else if (method == "content-aware") {
         psrContentAwareFill();
+    } else if (method == "action") {
+        result.actionSteps = psrPlayRecordedAction(cfg.actionSet, cfg.actionName);
     } else {
         throw psrError("알 수 없는 제거 방식입니다: " + method);
     }
@@ -448,6 +459,65 @@ function psrContentAwareFill() {
     desc.putUnitDouble(cTID("Opct"), cTID("#Prc"), 100);
     desc.putEnumerated(cTID("Md  "), cTID("BlnM"), cTID("Nrml"));
     executeAction(cTID("Fl  "), desc, DialogModes.NO);
+}
+
+// --------------------------------------------------------- recorded actions
+
+// Play a recorded action on the current selection; returns its step names.
+function psrPlayRecordedAction(setName, actionName) {
+    var info = psrFindRecordedAction(setName, actionName);
+    var label = "'" + setName + " > " + actionName + "'";
+    if (!info.found) {
+        throw psrError("Photoshop 동작 " + label + "을(를) 찾을 수 없습니다. 동작 패널에서 '" + setName +
+            "' 세트 안에 '" + actionName + "' 동작을 만들고, 선택 영역이 있는 상태에서 작업 표시줄의 [제거] 버튼을 " +
+            "누르는 것을 녹화하세요.");
+    }
+    if (info.stepCount === 0) {
+        throw psrError("동작 " + label + "에 녹화된 단계가 없습니다. 녹화 중에 [제거] 버튼을 눌렀는데도 단계가 " +
+            "생기지 않았다면, 이 Photoshop 버전은 그 버튼을 동작으로 녹화할 수 없습니다.");
+    }
+    app.doAction(actionName, setName);
+    return info.steps;
+}
+
+// Look an action up in the Actions panel. Sets, actions and their steps are
+// addressed by 1-based index; asking past the last one throws.
+function psrFindRecordedAction(setName, actionName) {
+    var info = { setFound: false, found: false, stepCount: null, steps: [] };
+    for (var i = 1; i <= 1000; i++) {
+        var setDesc = psrActionGet([["ASet", i]]);
+        if (!setDesc) break;
+        if (psrDescName(setDesc) != setName) continue;
+        info.setFound = true;
+        var actionCount = setDesc.hasKey(cTID("NmbC")) ? setDesc.getInteger(cTID("NmbC")) : 0;
+        for (var j = 1; j <= actionCount; j++) {
+            var actionDesc = psrActionGet([["Actn", j], ["ASet", i]]);
+            if (!actionDesc || psrDescName(actionDesc) != actionName) continue;
+            info.found = true;
+            if (actionDesc.hasKey(cTID("NmbC"))) info.stepCount = actionDesc.getInteger(cTID("NmbC"));
+            for (var k = 1; k <= (info.stepCount || 0); k++) {
+                var stepDesc = psrActionGet([["Cmnd", k], ["Actn", j], ["ASet", i]]);
+                info.steps.push(stepDesc ? psrDescName(stepDesc) || "?" : "?");
+            }
+            return info;
+        }
+        // Several sets may share a name; keep looking.
+    }
+    return info;
+}
+
+function psrDescName(desc) {
+    return desc.hasKey(cTID("Nm  ")) ? desc.getString(cTID("Nm  ")) : null;
+}
+
+function psrActionGet(parts) {
+    var ref = new ActionReference();
+    for (var i = 0; i < parts.length; i++) ref.putIndex(cTID(parts[i][0]), parts[i][1]);
+    try {
+        return executeActionGet(ref);
+    } catch (e) {
+        return null; // no such item
+    }
 }
 
 // ------------------------------------------------------------------- saving
@@ -641,12 +711,18 @@ function psrDescribeError(e) {
 
 function psrAlertResult(result) {
     var message;
-    if (result.ok) {
-        message = "선택 영역을 제거했습니다.";
-        if (result.output) message += "\n저장 위치: " + result.output;
-    } else {
+    if (!result.ok) {
         message = "작업을 끝내지 못했습니다.\n" + result.error;
         if (result.leftOpen) message += "\n\n작업하던 사진은 Photoshop에 열어 두었습니다.";
+    } else if (result.action == "open") {
+        message = "사진을 열었습니다.";
+    } else if (result.action == "find_action") {
+        message = result.recordedAction.found
+            ? "동작을 찾았습니다. 녹화된 단계: " + result.recordedAction.steps.join(", ")
+            : "동작을 찾지 못했습니다.";
+    } else {
+        message = "선택 영역을 제거했습니다.";
+        if (result.output) message += "\n저장 위치: " + result.output;
     }
     for (var i = 0; i < result.warnings.length; i++) message += "\n- " + result.warnings[i];
     alert(message, "ps-remover");

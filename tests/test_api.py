@@ -50,6 +50,22 @@ class ConfigTests(unittest.TestCase):
             {"method": "transparent", "expand": 7, "feather": 1.5, "subject": True, "keepOpen": False, "report": "return"},
         )
 
+    def test_action_method_config(self):
+        options = api.RemoveOptions(method="action", action_set="내 동작", action_name="지우기")
+        config = api.build_remove_config("in.jpg", "out.jpg", [shapes.rect(0, 0, 10, 10)], options)
+        self.assertEqual((config["method"], config["actionSet"], config["actionName"]), ("action", "내 동작", "지우기"))
+        current = api.build_remove_current_config(options)
+        self.assertEqual((current["actionSet"], current["actionName"]), ("내 동작", "지우기"))
+        # The removal keeps the photo's format, like content-aware fill.
+        self.assertEqual(api.default_output_path("x/cat.jpg", "action").name, "cat_removed.jpg")
+
+    def test_action_method_needs_names(self):
+        for options in (api.RemoveOptions(method="action", action_set=" "),
+                        api.RemoveOptions(method="action", action_name="")):
+            with self.subTest(options=options), self.assertRaises(api.JobError):
+                options.validate()
+        api.RemoveOptions(method="content-aware", action_name="").validate()  # only matters for "action"
+
     def test_remove_config_needs_an_area(self):
         with self.assertRaises(api.JobError):
             api.build_remove_config("in.jpg", "out.jpg", [], api.RemoveOptions())
@@ -119,6 +135,13 @@ class RemoveAreaTests(unittest.TestCase):
         with mock.patch.object(api, "run_jsx", return_value={"ok": True}) as run:
             api.open_photo(self.photo)
         self.assertRegex(run.call_args.args[0], r'var PSR_CONFIG = \{"action":"open"')
+
+    def test_find_recorded_action(self):
+        info = {"setFound": True, "found": True, "stepCount": 1, "steps": ["제거"]}
+        with mock.patch.object(api, "run_jsx", return_value={"ok": True, "recordedAction": info}) as run:
+            self.assertEqual(api.find_recorded_action(), info)
+        self.assertIn('"action":"find_action"', run.call_args.args[0])
+        self.assertIn('"actionName":"\\uc81c\\uac70"', run.call_args.args[0])  # "제거", escaped
 
     def test_export_script(self):
         config = api.build_remove_config(self.photo, self.photo.with_name("o.jpg"), [shapes.rect(0, 0, 5, 5)])

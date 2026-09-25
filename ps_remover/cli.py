@@ -22,6 +22,9 @@ EPILOG = """\
   ps-remover remove 사진.jpg --ellipse 50,60,40,40 --polygon "10,10 90,15 60,80"
   ps-remover remove *.jpg --selection 워터마크.json --output-dir 결과
   ps-remover remove 인물.jpg --subject                  Photoshop '피사체 선택'으로 찾은 대상을 지우기
+  ps-remover remove 사진.jpg --rect 120,80,300,200 --method action
+                                                        녹화해 둔 동작으로 Photoshop [제거] 버튼 쓰기
+  ps-remover check-action                               [제거] 버튼 동작이 녹화되어 있는지 확인
   ps-remover open 사진.jpg                              Photoshop에서 사진만 열기
   ps-remover remove-selection                           Photoshop에서 직접 선택한 영역 지우기
 """
@@ -82,19 +85,37 @@ def build_parser() -> argparse.ArgumentParser:
     current.add_argument("-o", "--output", help="결과를 이 경로에도 저장 (생략하면 저장하지 않음)")
     current.add_argument("--export-jsx", metavar="파일.jsx", help="Photoshop 스크립트 파일로 저장만 하기")
     _add_common_options(current)
+
+    check = commands.add_parser(
+        "check-action",
+        help="--method action에 쓸 Photoshop 동작이 녹화되어 있는지 확인",
+        description="Photoshop 동작 패널에서 동작을 찾아, 녹화된 단계를 보여 줍니다.",
+    )
+    _add_action_options(check)
+    _add_common_options(check)
     return parser
 
 
 def _add_removal_options(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("제거 방식")
     group.add_argument("--method", choices=api.METHODS, default="content-aware",
-                       help="content-aware: 주변 내용으로 자연스럽게 채움 (기본값), transparent: 투명하게 잘라냄")
+                       help="content-aware: 주변 내용으로 자연스럽게 채움 (기본값), "
+                            "action: 녹화해 둔 Photoshop 동작 실행 (작업 표시줄의 [제거] 버튼 등), "
+                            "transparent: 투명하게 잘라냄")
+    _add_action_options(group)
     group.add_argument("--expand", type=int, default=4, metavar="PX",
                        help="지우기 전에 선택 영역을 넓힐 픽셀 수 (기본값: %(default)s)")
     group.add_argument("--feather", type=float, default=0.0, metavar="PX",
                        help="선택 영역 가장자리를 부드럽게 할 픽셀 수 (기본값: %(default)s)")
     group.add_argument("--jpeg-quality", type=int, default=12, metavar="0-12",
                        help="JPG로 저장할 때 품질 (기본값: %(default)s)")
+
+
+def _add_action_options(group) -> None:
+    group.add_argument("--action-set", default=api.DEFAULT_ACTION_SET, metavar="세트",
+                       help="Photoshop 동작 세트 이름 (기본값: %(default)s)")
+    group.add_argument("--action", dest="action_name", default=api.DEFAULT_ACTION_NAME, metavar="동작",
+                       help="Photoshop 동작 이름 (기본값: %(default)s)")
 
 
 def _add_common_options(parser: argparse.ArgumentParser) -> None:
@@ -120,6 +141,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_remove(args)
         if args.command == "open":
             return _cmd_open(args)
+        if args.command == "check-action":
+            return _cmd_check_action(args)
         return _cmd_remove_selection(args)
     except (SelectionError, api.JobError, PhotoshopError, OSError) as exc:
         _error(str(exc))
@@ -206,6 +229,23 @@ def _expand_photos(patterns: Sequence[str]) -> List[Path]:
     return photos
 
 
+def _cmd_check_action(args) -> int:
+    info = api.find_recorded_action(args.action_set, args.action_name, photoshop=args.photoshop, timeout=args.timeout)
+    label = f"'{args.action_set} > {args.action_name}'"
+    if info.get("found") and info.get("stepCount") != 0:
+        text = f"Photoshop 동작 {label}을(를) 찾았습니다. 녹화된 단계: {', '.join(info.get('steps') or []) or '(알 수 없음)'}"
+        _print(args, dict(info, ok=True), text)
+        return 0
+    if info.get("found"):
+        reason = "동작은 있지만 녹화된 단계가 없습니다."
+    elif info.get("setFound"):
+        reason = f"'{args.action_set}' 세트는 있지만 '{args.action_name}' 동작이 없습니다."
+    else:
+        reason = f"'{args.action_set}' 세트가 없습니다."
+    _print(args, dict(info, ok=False), f"Photoshop 동작 {label}을(를) 쓸 수 없습니다: {reason}\n{api.ACTION_SETUP_HELP}")
+    return 1
+
+
 def _collect_shapes(args):
     shapes: List[Shape] = []
     image_size = None
@@ -222,6 +262,8 @@ def _collect_shapes(args):
 def _removal_options(args) -> api.RemoveOptions:
     options = api.RemoveOptions(
         method=args.method,
+        action_set=args.action_set,
+        action_name=args.action_name,
         expand=args.expand,
         feather=args.feather,
         subject=getattr(args, "subject", False),

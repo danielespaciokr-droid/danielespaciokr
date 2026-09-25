@@ -121,7 +121,14 @@ function stringIDToTypeID(id) {
 }
 
 class ActionDescriptor {
-  constructor() { this.data = {}; }
+  constructor(data) { this.data = data || {}; }
+  hasKey(key) { return Object.prototype.hasOwnProperty.call(this.data, key); }
+  getString(key) { return this._get(key, 'string'); }
+  getInteger(key) { return this._get(key, 'number'); }
+  _get(key, type) {
+    if (typeof this.data[key] !== type) throw new Error(`mock: descriptor has no ${type} ${JSON.stringify(key)}`);
+    return this.data[key];
+  }
   putReference(key, ref) { this.data[key] = { ref: ref.parts }; }
   putString(key, value) { this.data[key] = String(value); }
   putBoolean(key, value) { this.data[key] = !!value; }
@@ -184,6 +191,27 @@ function executeAction(event, desc, mode) {
       break;
   }
   return new ActionDescriptor();
+}
+
+// The Actions panel: scenario.actionSets = [{name, actions: [{name, steps: [...], addsLayer, fails}]}].
+// Sets, actions and steps are addressed by 1-based index, innermost first.
+function executeActionGet(ref) {
+  const parts = ref.parts;
+  const want = ['Cmnd', 'Actn', 'ASet'].slice(3 - parts.length);
+  if (!parts.length || parts.some((p, i) => p.cls !== want[i] || typeof p.index !== 'number')) {
+    throw new Error('mock: unsupported reference ' + JSON.stringify(parts));
+  }
+  const [set, action, step] = parts.slice().reverse().map(p => p.index - 1);
+  const sets = scenario.actionSets || [];
+  const setSpec = sets[set];
+  const actionSpec = setSpec && action !== undefined ? setSpec.actions[action] : undefined;
+  const missing = () => psError('The object is not currently available.');
+  if (!setSpec) throw missing();
+  if (action === undefined) return new ActionDescriptor({ 'Nm  ': setSpec.name, NmbC: setSpec.actions.length });
+  if (!actionSpec) throw missing();
+  if (step === undefined) return new ActionDescriptor({ 'Nm  ': actionSpec.name, NmbC: actionSpec.steps.length });
+  if (step >= actionSpec.steps.length) throw missing();
+  return new ActionDescriptor({ 'Nm  ': actionSpec.steps[step] });
 }
 
 function union(a, b) {
@@ -416,6 +444,19 @@ const app = {
   bringToFront() {
     record('bringToFront');
   },
+  doAction(action, set) {
+    record('doAction', action, set, this._active && this._active.selection.box);
+    const setSpec = (scenario.actionSets || []).find(s => s.name === set && s.actions.some(a => a.name === action));
+    if (!setSpec) throw psError(`The object "action "${action}" of set "${set}"" is not currently available.`);
+    const spec = setSpec.actions.find(a => a.name === action);
+    if (spec.fails) throw psError(spec.fails);
+    if (spec.addsLayer) {
+      const doc = this.activeDocument;
+      const layer = new Layer({ name: 'Remove' });
+      doc.layers.unshift(layer);
+      doc.activeLayer = layer;
+    }
+  },
   _add(doc) {
     this.documents.push(doc);
     this._active = doc;
@@ -435,7 +476,7 @@ for (const spec of scenario.openDocuments || []) {
 const sandbox = {
   app, File, Folder, UnitValue,
   ActionDescriptor, ActionReference, ActionList,
-  charIDToTypeID, stringIDToTypeID, executeAction,
+  charIDToTypeID, stringIDToTypeID, executeAction, executeActionGet,
   DialogModes, Units, SaveOptions, DocumentMode, ChangeMode, BitsPerChannelType, ResampleMethod,
   LayerKind, SelectionType, FormatOptions, MatteType, TIFFEncoding, RasterizeType,
   JPEGSaveOptions, PNGSaveOptions, TiffSaveOptions, PhotoshopSaveOptions,

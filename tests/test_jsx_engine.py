@@ -291,6 +291,87 @@ class JsxEngineTests(unittest.TestCase):
         self.assertEqual(out["documents"], [])
         self.assertEqual(self.calls(out, "bringToFront"), [])
 
+    # ----------------------------------------------------- recorded action
+
+    ACTION_SETS = [
+        {"name": "Default Actions", "actions": [{"name": "Vignette", "steps": ["Make", "Set"]}]},
+        {"name": "ps-remover", "actions": [{"name": "Other", "steps": ["Fill"]},
+                                          {"name": "제거", "steps": ["제거"], "addsLayer": True}]},
+    ]
+
+    def test_recorded_action_is_played_on_the_selection(self):
+        out = self.run_script(remove_config(options=api.RemoveOptions(method="action")), actionSets=self.ACTION_SETS)
+        report = out["report"]
+        self.assertTrue(report["ok"], report.get("error"))
+        self.assertEqual(report["actionSteps"], ["제거"])
+        play = self.calls(out, "doAction")
+        self.assertEqual(len(play), 1)
+        self.assertEqual(play[0][1:3], ["제거", "ps-remover"])
+        self.assertEqual(play[0][3], [96, 46, 304, 254])  # the grown selection is active while it plays
+        self.assertEqual(self.actions(out, "Fl  "), [])
+        names = [entry[0] for entry in out["log"]]
+        self.assertLess(names.index("doAction"), names.index("saveAs"))
+
+    def test_recorded_action_with_custom_names(self):
+        options = api.RemoveOptions(method="action", action_set="Default Actions", action_name="Vignette")
+        out = self.run_script(remove_config(options=options), actionSets=self.ACTION_SETS)
+        self.assertTrue(out["report"]["ok"])
+        self.assertEqual(out["report"]["actionSteps"], ["Make", "Set"])
+        self.assertEqual(self.calls(out, "doAction")[0][1:3], ["Vignette", "Default Actions"])
+
+    def test_missing_recorded_action(self):
+        cases = [
+            ([], "찾을 수 없습니다"),
+            ([{"name": "ps-remover", "actions": [{"name": "Other", "steps": ["Fill"]}]}], "찾을 수 없습니다"),
+            ([{"name": "ps-remover", "actions": [{"name": "제거", "steps": []}]}], "녹화된 단계가 없습니다"),
+        ]
+        for action_sets, message in cases:
+            with self.subTest(message=message, sets=len(action_sets)):
+                out = self.run_script(remove_config(options=api.RemoveOptions(method="action")), actionSets=action_sets)
+                report = out["report"]
+                self.assertFalse(report["ok"])
+                self.assertIn(message, report["error"])
+                self.assertEqual(self.calls(out, "doAction"), [])
+                self.assertEqual(self.calls(out, "saveAs"), [])
+
+    def test_action_found_in_a_later_set_with_the_same_name(self):
+        sets = [{"name": "ps-remover", "actions": [{"name": "Other", "steps": ["Fill"]}]},
+                {"name": "ps-remover", "actions": [{"name": "제거", "steps": ["Remove"]}]}]
+        out = self.run_script(remove_config(options=api.RemoveOptions(method="action")), actionSets=sets)
+        self.assertTrue(out["report"]["ok"])
+        self.assertEqual(out["report"]["actionSteps"], ["Remove"])
+
+    def test_failing_recorded_action(self):
+        sets = [{"name": "ps-remover", "actions": [{"name": "제거", "steps": ["제거"], "fails": "Sign in required."}]}]
+        out = self.run_script(remove_config(options=api.RemoveOptions(method="action")), actionSets=sets)
+        self.assertFalse(out["report"]["ok"])
+        self.assertIn("Sign in required", out["report"]["error"])
+        self.assertTrue(out["report"]["leftOpen"])
+
+    def test_remove_current_with_recorded_action(self):
+        config = api.build_remove_current_config(api.RemoveOptions(method="action", expand=0))
+        # A text layer would stop content-aware fill, but the recorded action decides for itself.
+        doc = {"file": PHOTO, "selection": [10, 10, 50, 50], "layers": [{"name": "T", "kind": "TEXT"}]}
+        out = self.run_script(config, openDocuments=[doc], actionSets=self.ACTION_SETS)
+        report = out["report"]
+        self.assertTrue(report["ok"], report.get("error"))
+        self.assertEqual(len(self.calls(out, "suspendHistory")), 1)
+        self.assertEqual(self.calls(out, "doAction")[0][1:], ["제거", "ps-remover", [10, 10, 50, 50]])
+
+    def test_find_action(self):
+        config = {"action": "find_action", "actionSet": "ps-remover", "actionName": "제거", "report": "return"}
+        info = self.run_script(config, actionSets=self.ACTION_SETS)["report"]["recordedAction"]
+        self.assertEqual(info, {"setFound": True, "found": True, "stepCount": 1, "steps": ["제거"]})
+        info = self.run_script(dict(config, actionName="없음"), actionSets=self.ACTION_SETS)["report"]["recordedAction"]
+        self.assertEqual((info["setFound"], info["found"]), (True, False))
+        info = self.run_script(config)["report"]["recordedAction"]
+        self.assertEqual((info["setFound"], info["found"]), (False, False))
+
+    def test_find_action_alert(self):
+        config = {"action": "find_action", "actionSet": "ps-remover", "actionName": "제거", "report": "alert"}
+        out = self.run_script(config, actionSets=self.ACTION_SETS)
+        self.assertIn("녹화된 단계: 제거", out["alerts"][0][0])
+
     # ------------------------------------------------------------ subject
 
     def test_subject_inside_drawn_area(self):

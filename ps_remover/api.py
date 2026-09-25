@@ -11,7 +11,18 @@ from .photoshop import run_jsx
 from .script import build_script
 from .shapes import Shape, has_area, selection_ops
 
-METHODS = ("content-aware", "transparent")
+METHODS = ("content-aware", "action", "transparent")
+DEFAULT_ACTION_SET = "ps-remover"
+DEFAULT_ACTION_NAME = "제거"
+
+# Photoshop cannot press Contextual Task Bar buttons from a script, but it can
+# play an Action in which the user recorded pressing one.
+ACTION_SETUP_HELP = f"""\
+Photoshop 작업 표시줄의 [제거] 버튼을 쓰려면 한 번만 동작으로 녹화해 두세요:
+  1. Photoshop에서 아무 사진이나 열고 지울 부분을 선택합니다.
+  2. [창 > 동작]을 열고, 새 세트를 '{DEFAULT_ACTION_SET}' 이름으로 만듭니다.
+  3. 그 세트에 새 동작을 '{DEFAULT_ACTION_NAME}' 이름으로 만들고 [기록]을 누릅니다.
+  4. 작업 표시줄의 [제거] 버튼을 누르고, 결과가 나오면 동작 패널의 정지(■) 버튼을 누릅니다."""
 SAVE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".psd")
 TRANSPARENCY_EXTENSIONS = (".png", ".tif", ".tiff", ".psd")
 DEFAULT_SUFFIX = "_removed"
@@ -23,7 +34,12 @@ class JobError(ValueError):
 
 @dataclass
 class RemoveOptions:
-    method: str = "content-aware"  # "content-aware": fill in from the surroundings, "transparent": cut out
+    # "content-aware": fill in from the surroundings (Edit > Fill > Content-Aware)
+    # "action":        play a recorded Photoshop action, e.g. a click on the task bar's Remove button
+    # "transparent":   cut the area out
+    method: str = "content-aware"
+    action_set: str = DEFAULT_ACTION_SET
+    action_name: str = DEFAULT_ACTION_NAME
     expand: int = 4                # grow the selection by this many pixels before removing
     feather: float = 0.0           # soften the selection edge (pixels)
     subject: bool = False          # keep only what Photoshop's Select Subject finds inside the area
@@ -33,6 +49,8 @@ class RemoveOptions:
     def validate(self) -> None:
         if self.method not in METHODS:
             raise JobError(f"제거 방식은 {', '.join(METHODS)} 중 하나여야 합니다: {self.method!r}")
+        if self.method == "action" and not (self.action_set.strip() and self.action_name.strip()):
+            raise JobError("실행할 Photoshop 동작의 세트 이름과 동작 이름을 입력하세요.")
         if not 0 <= self.expand <= 100:
             raise JobError("선택 영역 확장은 0~100 픽셀이어야 합니다.")
         if not 0 <= self.feather <= 250:
@@ -83,6 +101,8 @@ def build_remove_config(photo, output, shapes: Sequence[Shape], options: Optiona
         "subject": bool(options.subject),
         "expectedSize": [int(image_size[0]), int(image_size[1])] if image_size else None,
         "method": options.method,
+        "actionSet": options.action_set,
+        "actionName": options.action_name,
         "expand": int(options.expand),
         "feather": float(options.feather),
         "keepOpen": bool(options.keep_open),
@@ -133,6 +153,8 @@ def build_remove_current_config(options: Optional[RemoveOptions] = None, output=
         "action": "remove_current",
         "output": _abspath(output) if output is not None else None,
         "method": options.method,
+        "actionSet": options.action_set,
+        "actionName": options.action_name,
         "expand": int(options.expand),
         "feather": float(options.feather),
         "jpegQuality": int(options.jpeg_quality),
@@ -149,6 +171,17 @@ def remove_current_selection(options: Optional[RemoveOptions] = None, output=Non
     """
     config = build_remove_current_config(options, output)
     return run_jsx(build_script(config), photoshop=photoshop, timeout=timeout)
+
+
+def find_recorded_action(action_set: str = DEFAULT_ACTION_SET, action_name: str = DEFAULT_ACTION_NAME,
+                         photoshop: Optional[str] = None, timeout: Optional[float] = None) -> dict:
+    """Look the action up in Photoshop's Actions panel.
+
+    Returns ``{"setFound", "found", "stepCount", "steps"}``; ``steps`` are the
+    names of the recorded steps as the Actions panel shows them.
+    """
+    config = {"action": "find_action", "actionSet": action_set, "actionName": action_name, "report": "return"}
+    return run_jsx(build_script(config), photoshop=photoshop, timeout=timeout)["recordedAction"]
 
 
 def export_script(path, config: dict) -> Path:
