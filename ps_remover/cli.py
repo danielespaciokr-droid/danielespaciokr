@@ -26,11 +26,14 @@ EPILOG = """\
   ps-remover remove 인물.jpg --subject                  Photoshop '피사체 선택'으로 찾은 대상을 지우기
   ps-remover batch 사진폴더 --preset 워터마크           폴더의 새 사진마다 공통 영역 지우기
   ps-remover batch 사진폴더 --preset 워터마크 --watch   새 사진이 들어올 때마다 계속 지우기
+  ps-remover batch 사진폴더 --preset 워터마크 --watch --adjust
+                                                        지운 뒤 녹화해 둔 보정 동작(Camera Raw 필터 등)까지 적용
   ps-remover watch                                      폴더 자동 처리 창만 열기 (저장된 설정으로 바로 시작)
   ps-remover presets                                    저장된 공통 영역 보기
   ps-remover remove 사진.jpg --rect 120,80,300,200 --method action
                                                         녹화해 둔 동작으로 Photoshop [제거] 버튼 쓰기
   ps-remover check-action                               [제거] 버튼 동작이 녹화되어 있는지 확인
+  ps-remover check-action --action 보정                 보정 동작이 녹화되어 있는지 확인
   ps-remover open 사진.jpg --preset 워터마크            Photoshop에서 사진을 열고 공통 영역을 선택해 두기
   ps-remover remove-selection                           Photoshop에서 직접 선택한 영역 지우기
 """
@@ -125,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Photoshop에서 직접 선택한 영역을 지움",
         description="Photoshop에서 활성 문서의 현재 선택 영역을 지웁니다. Photoshop에서 [실행 취소] 한 번으로 되돌릴 수 있습니다.",
     )
-    _add_removal_options(current)
+    _add_removal_options(current, adjust=False)
     current.add_argument("-o", "--output", help="결과를 이 경로에도 저장 (생략하면 저장하지 않음)")
     current.add_argument("--export-jsx", metavar="파일.jsx", help="Photoshop 스크립트 파일로 저장만 하기")
     _add_common_options(current)
@@ -153,7 +156,7 @@ def _add_area_options(parser: argparse.ArgumentParser, subject: bool = True) -> 
                           help="Photoshop '피사체 선택' 사용. 영역을 함께 주면 그 안의 피사체만 지움 (CC 2018 이상)")
 
 
-def _add_removal_options(parser: argparse.ArgumentParser) -> None:
+def _add_removal_options(parser: argparse.ArgumentParser, adjust: bool = True) -> None:
     group = parser.add_argument_group("제거 방식")
     group.add_argument("--method", choices=api.METHODS, default="content-aware",
                        help="content-aware: 주변 내용으로 자연스럽게 채움 (기본값), "
@@ -163,6 +166,14 @@ def _add_removal_options(parser: argparse.ArgumentParser) -> None:
     _add_refine_options(group)
     group.add_argument("--jpeg-quality", type=int, default=12, metavar="0-12",
                        help="JPG로 저장할 때 품질 (기본값: %(default)s)")
+    if adjust:
+        extra = parser.add_argument_group("보정")
+        extra.add_argument("--adjust", action="store_true",
+                           help="지운 뒤 녹화해 둔 Photoshop 동작(Camera Raw 필터 등)을 사진 전체에 적용")
+        extra.add_argument("--adjust-set", default=api.DEFAULT_ACTION_SET, metavar="세트",
+                           help="보정 동작의 세트 이름 (기본값: %(default)s)")
+        extra.add_argument("--adjust-action", dest="adjust_name", default=api.DEFAULT_ADJUST_NAME, metavar="동작",
+                           help="보정 동작 이름 (기본값: %(default)s)")
 
 
 def _add_refine_options(group) -> None:
@@ -303,7 +314,7 @@ class _BatchReport:
         elif kind == "error":
             _error(event["error"])
             if event.get("retry"):
-                print("    Photoshop 문제가 해결되면 저절로 이어서 지웁니다.", flush=True)
+                print("    이 문제가 해결되면 저절로 이어서 처리합니다.", flush=True)
         elif kind == "waiting":
             print("새 사진을 기다리는 중입니다... (끝내려면 Ctrl+C)", flush=True)
         elif kind == "finished":
@@ -437,6 +448,9 @@ def _removal_options(args) -> api.RemoveOptions:
         feather=args.feather,
         subject=getattr(args, "subject", False),
         jpeg_quality=args.jpeg_quality,
+        adjust=getattr(args, "adjust", False),
+        adjust_set=getattr(args, "adjust_set", api.DEFAULT_ACTION_SET),
+        adjust_name=getattr(args, "adjust_name", api.DEFAULT_ADJUST_NAME),
     )
     options.validate()
     return options

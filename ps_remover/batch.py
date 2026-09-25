@@ -103,8 +103,9 @@ class BatchRunner:
       start     photo, index, count     about to process a photo of this round
       done      photo, result
       failed    photo, error, result    that photo failed (it is not retried); the run goes on
-      error     error, retry            Photoshop trouble; with retry (watch mode) it is tried again
-                                        later, and the same error is not reported twice in a row
+      error     error, retry            trouble that is not the photo's (Photoshop, a recorded action
+                                        missing, the folder away); with retry (watch mode) it is tried
+                                        again later, and the same error is not reported twice in a row
       waiting                           watch mode: no new photos right now
       finished  done, failed, error     the run is over
     """
@@ -134,28 +135,41 @@ class BatchRunner:
         error = None
         waiting = False
         while not self._stop.is_set():
-            ready, settling = self._check(self.job.candidates(skip=self.handled), time.time(), watch)
+            try:
+                candidates = self.job.candidates(skip=self.handled)
+            except OSError as exc:  # e.g. a network folder that is away for a moment
+                status, error = self._trouble(f"사진 폴더를 읽을 수 없습니다: {exc}", watch)
+                if status == "fatal":
+                    break
+                self._wait_after_trouble(interval)
+                continue
+            ready, settling = self._check(candidates, time.time(), watch)
             if ready:
                 waiting = False
                 status, error = self._process(ready, watch)
                 if status == "fatal":
                     break
                 if status == "retry":
-                    # Photoshop needs the user (a dialog, privileges, ...): ask it less and less often.
-                    delay = max(interval, RETRY_MIN_SECONDS) * 2 ** self._retries
-                    self._retries += 1
-                    self._stop.wait(min(delay, RETRY_MAX_SECONDS))
+                    self._wait_after_trouble(interval)
                 continue  # look again at once: more photos may have arrived meanwhile
             if settling:
                 self._stop.wait(SETTLE_POLL_SECONDS)
                 continue
             if not watch:
                 break
+            # All is well again: the next trouble is reported and waited out from the start.
+            error, self._retries, self._last_error = None, 0, None
             if not waiting:
                 self._emit("waiting")
                 waiting = True
             self._stop.wait(interval)
         self._emit("finished", done=self.done, failed=len(self.failed), error=error)
+
+    def _wait_after_trouble(self, interval: float) -> None:
+        # The user has to step in (a dialog, privileges, a recording): ask less and less often.
+        delay = max(interval, RETRY_MIN_SECONDS) * 2 ** self._retries
+        self._retries += 1
+        self._stop.wait(min(delay, RETRY_MAX_SECONDS))
 
     def _check(self, candidates: List[Tuple[Path, Snapshot]], now: float, watch: bool) -> Tuple[List[Path], int]:
         """``(photos ready to process, number that may still be copying)``.
@@ -183,7 +197,10 @@ class BatchRunner:
         return ready, settling
 
     def _process(self, photos: List[Path], watch: bool) -> Tuple[str, Optional[str]]:
-        self.job.output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.job.output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return self._trouble(f"저장 폴더를 만들 수 없습니다: {exc}", watch)
         for index, photo in enumerate(photos):
             if self._stop.is_set():
                 break
@@ -193,16 +210,16 @@ class BatchRunner:
                                       overwrite=not self.job.skip_done, photoshop=self.job.photoshop,
                                       timeout=self.job.timeout)
             except ScriptFailed as exc:
+                if exc.result.get("setupProblem"):
+                    # e.g. a recorded action is missing: every photo would fail the same way.
+                    return self._trouble(str(exc), watch)
                 self._fail(photo, str(exc), exc.result)
             except (PhotoshopNotFound, UnsupportedPlatform) as exc:
                 self._emit("error", error=str(exc), retry=False)
                 return "fatal", str(exc)
             except PhotoshopError as exc:
                 # Busy, timed out, ...: nothing wrong with the photo itself.
-                if str(exc) != self._last_error or not watch:
-                    self._emit("error", error=str(exc), retry=watch)
-                self._last_error = str(exc)
-                return ("retry", str(exc)) if watch else ("fatal", str(exc))
+                return self._trouble(str(exc), watch)
             except Exception as exc:  # noqa: BLE001 - one bad photo must not end a long run
                 self._fail(photo, str(exc) or exc.__class__.__name__, None)
             else:
@@ -211,6 +228,13 @@ class BatchRunner:
                 self._retries, self._last_error = 0, None
                 self._emit("done", photo=photo, result=result)
         return "ok", None
+
+    def _trouble(self, error: str, watch: bool) -> Tuple[str, str]:
+        """Report trouble that is not a photo's; watch mode tries again later."""
+        if error != self._last_error or not watch:
+            self._emit("error", error=error, retry=watch)
+        self._last_error = error
+        return ("retry", error) if watch else ("fatal", error)
 
     def _fail(self, photo: Path, error: str, result: Optional[dict]) -> None:
         self.handled.add(photo)

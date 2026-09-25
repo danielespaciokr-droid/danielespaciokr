@@ -199,6 +199,36 @@ class AppTests(unittest.TestCase):
             self.wait_idle()
         self.assertIn("세트가 없습니다", app.action_status.get())
 
+    def test_adjustment_is_sent_and_reported(self):
+        app = self.app
+        self.drag((100, 100), (300, 200))
+        app.adjust.set(True)
+        self.assertIn("보정", app.status.get())
+        result = {"ok": True, "output": "photo_removed.jpg", "warnings": [], "adjustSteps": ["Camera Raw 필터"]}
+        with mock.patch.object(gui.api, "remove_area", return_value=result) as remove:
+            app.run_remove()
+            self.wait_idle()
+        options = remove.call_args.args[3]
+        self.assertEqual((options.adjust, options.adjust_set, options.adjust_name), (True, "ps-remover", "보정"))
+        self.assertIn("지우고 보정까지 했습니다", app.status.get())
+
+    def test_adjustment_settings_dialog_checks_the_action(self):
+        app = self.app
+        app.open_adjust_settings()
+        self.pump(0.1)
+        self.assertTrue(app._adjust_dialog.winfo_exists())
+        app.open_adjust_settings()  # a second click brings the same dialog forward
+        self.assertEqual(len([w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel)]), 1)
+        info = {"setFound": True, "found": True, "stepCount": 1, "steps": ["Camera Raw 필터"]}
+        with mock.patch.object(gui.api, "find_recorded_action", return_value=info) as find:
+            app.check_adjust()
+            self.wait_idle()
+        self.assertEqual(find.call_args.args, ("ps-remover", "보정"))
+        self.assertIn("녹화된 단계: Camera Raw 필터", app.adjust_status.get())
+        self.assertTrue(app.adjust.get())  # a working adjustment is switched on
+        self.assertEqual(app.method.get(), "content-aware")  # the removal method is left alone
+        self.assertEqual(app.action_status.get(), "")
+
     def test_removal_settings_are_remembered(self):
         app = self.app
         app.method.set("action")
@@ -212,6 +242,14 @@ class AppTests(unittest.TestCase):
         settings.save_settings("main", {"method": "nonsense", "expand": 3})
         third = gui.RemoverApp(tk.Toplevel(self.root))
         self.assertEqual((third.method.get(), third.expand.get()), ("content-aware", "4"))  # bad values ignored
+
+    def test_settings_are_saved_as_they_change(self):
+        app = self.app
+        app.adjust.set(True)
+        app.adjust_name.set("필름")
+        self.pump(1.2)  # saved shortly after the last change, without closing the window
+        saved = settings.load_settings("main")
+        self.assertEqual((saved["adjust"], saved["adjust_name"]), (True, "필름"))
 
     def test_save_and_apply_common_area(self):
         app = self.app
@@ -384,14 +422,98 @@ class AppTests(unittest.TestCase):
         showinfo.assert_not_called()
         self.assertIn("폴더를 고르세요", window.status.get())
 
+    def test_batch_window_adjustment(self):
+        folder = Path(self.tmp.name) / "사진"
+        folder.mkdir()
+        path = folder / "a.jpg"
+        Image.new("RGB", (800, 600)).save(path)
+        stamp = time.time() - 60
+        os.utime(path, (stamp, stamp))
+        settings.save_preset("워터마크", shapes.Area([shapes.rect(0, 0, 10, 10)], (800, 600), "anchor"))
+        self.app._refresh_presets()
+        self.app.adjust.set(True)
+        self.app.adjust_name.set("필름")
+        self.app.open_batch_window()
+        window = self.app._batch_window
+        self.assertTrue(window.adjust.get())  # starts from the main window's choice
+        self.assertIn("'ps-remover > 필름'", window.adjust_info.get())
+        window.watch.set(False)
+        window.input_dir.set(str(folder))
+
+        def fake_remove(photo, area, output, options, **kwargs):
+            output.write_bytes(b"result")
+            return {"ok": True, "output": str(output), "warnings": [], "areaUsed": "landscape",
+                    "adjustSteps": ["Camera Raw 필터"]}
+
+        with mock.patch.object(gui.api, "remove_area", side_effect=fake_remove) as remove:
+            window.start()
+            for _ in range(200):
+                self.pump(0.02)
+                if not window.running:
+                    break
+        options = remove.call_args.args[3]
+        self.assertEqual((options.adjust, options.adjust_name), (True, "필름"))
+        log = window.log.get("1.0", "end")
+        self.assertIn("지우기 + 보정)", log)
+        self.assertIn("완료  a.jpg → a_removed.jpg (가로 사진용 영역, 보정)", log)
+        self.assertTrue(settings.load_settings("batch")["adjust"])
+        # Everything shown in the window also goes to today's log file.
+        logs = list(settings.log_dir().glob("auto-*.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertIn("완료  a.jpg → a_removed.jpg", logs[0].read_text(encoding="utf-8"))
+        window.close()
+
+    def test_watcher_restarts_itself_after_an_unexpected_error(self):
+        self.app.open_batch_window()
+        window = self.app._batch_window
+        window._watching = True
+        window._handle({"type": "finished", "done": 0, "failed": 0, "error": "예상하지 못한 오류: X",
+                        "crashed": True})
+        self.assertIsNotNone(window._restart_after)
+        self.assertIn("60초 뒤에 다시 시작합니다", window.log.get("1.0", "end"))
+        with mock.patch.object(window, "start") as start:
+            window._restart()
+        start.assert_called_once_with(quiet=True)
+        # Stopped by the user: no restart.
+        window._handle({"type": "finished", "done": 0, "failed": 0, "error": "X", "crashed": True})
+        window.stop()
+        self.assertIsNone(window._restart_after)
+        window._user_stopped = True
+        window._handle({"type": "finished", "done": 0, "failed": 0, "error": "X", "crashed": True})
+        self.assertIsNone(window._restart_after)
+        window.close()
+
+    def test_watching_keeps_the_computer_awake(self):
+        folder = Path(self.tmp.name) / "사진"
+        folder.mkdir()
+        settings.save_preset("워터마크", shapes.Area([shapes.rect(0, 0, 10, 10)], (800, 600), "anchor"))
+        self.app._refresh_presets()
+        self.app.open_batch_window()
+        window = self.app._batch_window
+        window.input_dir.set(str(folder))
+        window.watch.set(True)
+        with mock.patch.object(window._awake, "start", return_value=True) as awake_start, \
+                mock.patch.object(window._awake, "stop") as awake_stop:
+            window.start()
+            self.pump(0.3)
+            awake_start.assert_called_once()
+            self.assertIn("절전 모드로 들어가지 않습니다", window.log.get("1.0", "end"))
+            window.stop()
+            for _ in range(100):
+                self.pump(0.02)
+                if not window.running:
+                    break
+            awake_stop.assert_called()
+            window.close()
+
     def test_batch_window_says_it_will_carry_on_after_photoshop_trouble(self):
         self.app.open_batch_window()
         window = self.app._batch_window
         window._handle({"type": "error", "error": "Photoshop에 연결하지 못했습니다 (0x80080005).", "retry": True})
         log = window.log.get("1.0", "end")
         self.assertIn("0x80080005", log)
-        self.assertIn("저절로 다시 이어서 지웁니다", log)
-        self.assertIn("Photoshop 문제", window.status.get())
+        self.assertIn("저절로 다시 이어서 처리합니다", log)
+        self.assertIn("기다리는 중", window.status.get())
 
     def wait_idle(self):
         for _ in range(100):
@@ -452,7 +574,8 @@ class WatchWindowTests(unittest.TestCase):
         landscape = shapes.Area([shapes.rect(700, 550, 90, 40)], (800, 600), "anchor")
         portrait = shapes.Area([shapes.rect(500, 750, 90, 40)], (600, 800), "anchor")
         settings.save_preset("글씨", shapes.AreaSet.single(landscape).with_area(portrait))
-        settings.save_settings("main", {"method": "content-aware", "action_set": "내 동작", "action_name": "지우기"})
+        settings.save_settings("main", {"method": "content-aware", "action_set": "내 동작", "action_name": "지우기",
+                                        "adjust_set": "내 보정", "adjust_name": "필름"})
 
     def run_watch(self, start=False, until=None, seconds=5.0):
         """Runs gui.watch_main until ``until(window)`` holds; returns what the window showed."""
@@ -494,7 +617,8 @@ class WatchWindowTests(unittest.TestCase):
 
     def test_starts_by_itself_with_the_saved_settings(self):
         settings.save_settings("batch", {"preset": "글씨", "input_dir": str(self.folder), "method": "action",
-                                         "expand": "6", "watch": True, "interval": "1", "autostart": True})
+                                         "expand": "6", "adjust": True, "watch": True, "interval": "1",
+                                         "autostart": True})
         seen = self.run_watch(until=lambda window: "기다리는 중" in window.log.get("1.0", "end"))
         self.assertEqual(seen["title"], gui.BatchWindow.TITLE)
         self.assertTrue(seen["running"])  # still watching for more photos
@@ -503,6 +627,7 @@ class WatchWindowTests(unittest.TestCase):
         self.assertEqual(set(area.areas), {"landscape", "portrait"})
         self.assertEqual((options.method, options.expand, options.action_set, options.action_name),
                          ("action", 6, "내 동작", "지우기"))  # the action is the one set up in the main window
+        self.assertEqual((options.adjust, options.adjust_set, options.adjust_name), (True, "내 보정", "필름"))
         self.assertIn("완료  tall.jpg → tall_removed.jpg (세로 사진용 영역)", seen["log"])
         self.assertIn("완료  wide.jpg → wide_removed.jpg (가로 사진용 영역)", seen["log"])
         self.assertEqual(sorted(p.name for p in (self.folder / "지운 사진").iterdir()),
@@ -525,6 +650,42 @@ class WatchWindowTests(unittest.TestCase):
         showinfo.assert_not_called()  # nobody may be at the computer after sign-in
         self.assertFalse(seen["running"])
         self.assertIn("사진 폴더를 찾을 수 없습니다", seen["status"])
+
+    def test_folder_that_is_not_there_yet_is_tried_again(self):
+        later = Path(self.tmp.name) / "네트워크 드라이브" / "사진"
+        settings.save_settings("batch", {"preset": "글씨", "input_dir": str(later), "autostart": True})
+        root = tk.Tk()
+        self.addCleanup(self._destroy, root)
+        window = gui.BatchWindow(root, standalone=True)
+        with mock.patch.object(gui.BatchWindow, "RESTART_SECONDS", 0.2):
+            window.start_unattended()
+            self.assertFalse(window.running)
+            self.assertIsNotNone(window._restart_after)  # tries again by itself
+            self.assertIn("다시 시도합니다", window.log.get("1.0", "end"))
+            later.mkdir(parents=True)  # the drive is connected now
+            end = time.time() + 5
+            while time.time() < end and not window.running:
+                root.update()
+                time.sleep(0.02)
+            self.assertTrue(window.running)
+            self.assertEqual(window.log.get("1.0", "end").count("시작하지 못했습니다"), 1)
+            window.stop()
+            end = time.time() + 5
+            while time.time() < end and window.running:
+                root.update()
+                time.sleep(0.02)
+        # Nothing chosen yet: nothing to try again, the window says what is missing.
+        window.input_dir.set("")
+        window.start_unattended()
+        self.assertIsNone(window._restart_after)
+        self.assertIn("폴더를 고르세요", window.status.get())
+        # Typing a folder stops the retries of the old one.
+        window.input_dir.set(str(later / "없음"))
+        window.start_unattended()
+        self.assertIsNotNone(window._restart_after)
+        window.input_dir.set("C:/")
+        self.assertIsNone(window._restart_after)
+        window.close()
 
     def test_start_at_sign_in_option(self):
         appdata = Path(self.tmp.name) / "AppData"

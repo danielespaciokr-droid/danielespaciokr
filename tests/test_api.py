@@ -69,6 +69,21 @@ class ConfigTests(unittest.TestCase):
                 options.validate()
         api.RemoveOptions(method="content-aware", action_name="").validate()  # only matters for "action"
 
+    def test_adjustment_config(self):
+        area = shapes.Area([shapes.rect(0, 0, 10, 10)])
+        config = api.build_remove_config("in.jpg", "out.jpg", area, api.RemoveOptions())
+        self.assertEqual((config["adjustSet"], config["adjustName"]), (None, None))  # off unless asked
+        options = api.RemoveOptions(adjust=True)
+        config = api.build_remove_config("in.jpg", "out.jpg", area, options)
+        self.assertEqual((config["adjustSet"], config["adjustName"]), ("ps-remover", "보정"))
+        options = api.RemoveOptions(adjust=True, adjust_set=" 내 보정 ", adjust_name=" 필름 ")
+        config = api.build_remove_config("in.jpg", "out.jpg", area, options)
+        self.assertEqual((config["adjustSet"], config["adjustName"]), ("내 보정", "필름"))
+        for bad in (api.RemoveOptions(adjust=True, adjust_set=""), api.RemoveOptions(adjust=True, adjust_name=" ")):
+            with self.subTest(options=bad), self.assertRaises(api.JobError):
+                bad.validate()
+        api.RemoveOptions(adjust=False, adjust_name="").validate()  # only matters when adjusting
+
     def test_remove_config_needs_an_area(self):
         with self.assertRaises(api.JobError):
             api.build_remove_config("in.jpg", "out.jpg", shapes.Area([]), api.RemoveOptions())

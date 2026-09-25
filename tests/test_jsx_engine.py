@@ -381,6 +381,8 @@ class JsxEngineTests(unittest.TestCase):
                 report = out["report"]
                 self.assertFalse(report["ok"])
                 self.assertIn(message, report["error"])
+                self.assertTrue(report["setupProblem"])  # nothing wrong with the photo
+                self.assertEqual(self.calls(out, "open"), [])  # checked before opening it
                 self.assertEqual(self.calls(out, "doAction"), [])
                 self.assertEqual(self.calls(out, "saveAs"), [])
 
@@ -397,6 +399,84 @@ class JsxEngineTests(unittest.TestCase):
         self.assertFalse(out["report"]["ok"])
         self.assertIn("Sign in required", out["report"]["error"])
         self.assertTrue(out["report"]["leftOpen"])
+
+    # ------------------------------------------------ adjustment (Camera Raw)
+
+    ADJUST_SETS = [
+        {"name": "ps-remover", "actions": [{"name": "제거", "steps": ["제거"], "addsLayer": True},
+                                          {"name": "보정", "steps": ["Camera Raw 필터"]}]},
+    ]
+
+    def test_adjustment_is_played_on_the_whole_photo(self):
+        out = self.run_script(remove_config(options=api.RemoveOptions(adjust=True)), actionSets=self.ADJUST_SETS)
+        report = out["report"]
+        self.assertTrue(report["ok"], report.get("error"))
+        self.assertEqual(report["adjustSteps"], ["Camera Raw 필터"])
+        self.assertEqual([entry[1:] for entry in self.calls(out, "doAction")], [["보정", "ps-remover", None]])
+        names = [entry[0] if entry[0] != "executeAction" else entry[1] for entry in out["log"]]
+        # Removed first, then nothing selected while the filter runs, then saved.
+        self.assertIn("deselect", names[names.index("Fl  "):names.index("doAction")])
+        self.assertLess(names.index("doAction"), names.index("saveAs"))
+        self.assertEqual(self.calls(out, "flatten") + self.calls(out, "mergeVisibleLayers"), [])  # one layer
+
+    def test_adjustment_after_the_remove_button_sees_one_layer(self):
+        options = api.RemoveOptions(method="action", adjust=True)
+        out = self.run_script(remove_config(options=options), actionSets=self.ADJUST_SETS)
+        report = out["report"]
+        self.assertTrue(report["ok"], report.get("error"))
+        self.assertEqual((report["actionSteps"], report["adjustSteps"]), (["제거"], ["Camera Raw 필터"]))
+        plays = self.calls(out, "doAction")
+        self.assertEqual([entry[1:] for entry in plays], [["제거", "ps-remover", [96, 46, 304, 254]],
+                                                          ["보정", "ps-remover", None]])
+        plays_at = [i for i, entry in enumerate(out["log"]) if entry[0] == "doAction"]
+        merges_at = [i for i, entry in enumerate(out["log"]) if entry[0] == "mergeVisibleLayers"]
+        # The Remove button's layer is merged down before the filter runs.
+        self.assertTrue(any(plays_at[0] < i < plays_at[1] for i in merges_at))
+
+    def test_adjustment_with_custom_names(self):
+        sets = [{"name": "내 보정", "actions": [{"name": "필름 느낌", "steps": ["Camera Raw 필터", "선명 효과"]}]}]
+        options = api.RemoveOptions(adjust=True, adjust_set="내 보정", adjust_name="필름 느낌")
+        out = self.run_script(remove_config(options=options), actionSets=sets)
+        self.assertTrue(out["report"]["ok"], out["report"].get("error"))
+        self.assertEqual(out["report"]["adjustSteps"], ["Camera Raw 필터", "선명 효과"])
+        self.assertEqual(self.calls(out, "doAction")[0][1:3], ["필름 느낌", "내 보정"])
+
+    def test_missing_adjustment_is_a_setup_problem(self):
+        cases = [
+            ([{"name": "ps-remover", "actions": [{"name": "제거", "steps": ["제거"]}]}], "Camera Raw 필터 등 보정 작업을 녹화"),
+            ([{"name": "ps-remover", "actions": [{"name": "보정", "steps": []}]}], "[필터 > Camera Raw 필터]를 적용"),
+        ]
+        for action_sets, message in cases:
+            with self.subTest(message=message):
+                out = self.run_script(remove_config(options=api.RemoveOptions(adjust=True)), actionSets=action_sets)
+                report = out["report"]
+                self.assertFalse(report["ok"])
+                self.assertIn("'ps-remover > 보정'", report["error"])
+                self.assertIn(message, report["error"])
+                self.assertTrue(report["setupProblem"])
+                self.assertEqual(self.calls(out, "open"), [])  # the photo was not even opened
+
+    def test_failing_adjustment_leaves_the_photo_open(self):
+        sets = [{"name": "ps-remover", "actions": [{"name": "보정", "steps": ["Camera Raw 필터"],
+                                                    "fails": "Camera Raw Filter is not available."}]}]
+        out = self.run_script(remove_config(options=api.RemoveOptions(adjust=True)), actionSets=sets)
+        report = out["report"]
+        self.assertFalse(report["ok"])
+        self.assertIn("Camera Raw Filter is not available", report["error"])
+        self.assertNotIn("setupProblem", report)  # a real failure on this photo
+        self.assertTrue(report["leftOpen"])
+        self.assertEqual(self.calls(out, "saveAs"), [])
+
+    def test_no_adjustment_unless_asked(self):
+        out = self.run_script(remove_config(), actionSets=self.ADJUST_SETS)
+        self.assertTrue(out["report"]["ok"])
+        self.assertNotIn("adjustSteps", out["report"])
+        self.assertEqual(self.calls(out, "doAction"), [])
+
+    def test_adjustment_alert(self):
+        out = self.run_script(remove_config(options=api.RemoveOptions(adjust=True), report="alert"),
+                              actionSets=self.ADJUST_SETS)
+        self.assertIn("보정 동작도 적용했습니다", out["alerts"][0][0])
 
     def test_remove_current_with_recorded_action(self):
         config = api.build_remove_current_config(api.RemoveOptions(method="action", expand=0))

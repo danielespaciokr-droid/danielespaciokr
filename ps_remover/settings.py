@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -13,6 +14,7 @@ from .shapes import Area, AreaSet, SelectionError, load_area_set, save_area
 
 APP_NAME = "ps-remover"
 STARTUP_SCRIPT_NAME = "PS Remover 폴더 자동 처리.cmd"
+LOG_KEEP_DAYS = 30
 _BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
@@ -93,6 +95,39 @@ def _read_settings() -> dict:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+# ---------------------------------------------------- folder watcher log
+
+
+def log_dir() -> Path:
+    return config_dir() / "logs"
+
+
+def append_log(text: str, now: Optional[float] = None) -> None:
+    """Adds ``text`` to today's log of the folder watcher. Failing to write is ignored."""
+    stamp = time.localtime(now)
+    path = log_dir() / f"auto-{time.strftime('%Y-%m-%d', stamp)}.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S', stamp)}] {text}\n")
+    except OSError:
+        pass
+
+
+def prune_logs(keep_days: int = LOG_KEEP_DAYS, now: Optional[float] = None) -> None:
+    """Deletes watcher logs older than ``keep_days`` days, so a computer that is always on does not fill up."""
+    cutoff = (time.time() if now is None else now) - keep_days * 86400
+    try:
+        old = [path for path in log_dir().glob("auto-*.log") if path.stat().st_mtime < cutoff]
+    except OSError:
+        return
+    for path in old:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 # ------------------------------------------------------- start at sign-in

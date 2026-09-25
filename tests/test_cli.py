@@ -236,11 +236,13 @@ class CliTests(unittest.TestCase):
             return {"ok": True, "output": str(output), "warnings": []}
 
         with mock.patch("ps_remover.api.remove_area", side_effect=fake_remove) as remove:
-            code, out, err = run(["batch", str(folder), "--preset", "워터마크", "--method", "action"])
+            code, out, err = run(["batch", str(folder), "--preset", "워터마크", "--method", "action", "--adjust"])
             self.assertEqual(code, 0, err)
             self.assertIn("[2/2] b.jpg", out)
             self.assertIn("끝났습니다: 2장 완료, 0장 실패", out)
-            self.assertEqual(remove.call_args.args[3].method, "action")
+            options = remove.call_args.args[3]
+            self.assertEqual((options.method, options.adjust, options.adjust_set, options.adjust_name),
+                             ("action", True, "ps-remover", "보정"))
             self.assertTrue((folder / "지운 사진" / "b_removed.jpg").exists())
             code, out, _ = run(["batch", str(folder), "--preset", "워터마크"])
             self.assertIn("새로 지울 사진이 없습니다", out)
@@ -248,6 +250,21 @@ class CliTests(unittest.TestCase):
             events = [json.loads(line) for line in out.splitlines()]
             self.assertEqual([e["type"] for e in events].count("done"), 2)
             self.assertEqual(events[-1]["type"], "finished")
+
+    def test_adjustment_options(self):
+        with mock.patch("ps_remover.api.remove_area", return_value={"ok": True, "output": "x"}) as remove:
+            code, _, err = run(["remove", str(self.photo), "--rect", "0,0,5,5", "--adjust",
+                                "--adjust-set", "내 보정", "--adjust-action", "필름"])
+            self.assertEqual(code, 0, err)
+            options = remove.call_args.args[3]
+            self.assertEqual((options.adjust, options.adjust_set, options.adjust_name), (True, "내 보정", "필름"))
+            run(["remove", str(self.photo), "--rect", "0,0,5,5"])
+            self.assertFalse(remove.call_args.args[3].adjust)  # off unless asked
+        code, _, err = run(["remove", str(self.photo), "--rect", "0,0,5,5", "--adjust", "--adjust-action", " "])
+        self.assertEqual(code, 1)
+        self.assertIn("보정에 쓸 Photoshop 동작", err)
+        with self.assertRaises(SystemExit):  # removing the current selection does not adjust
+            run(["remove-selection", "--adjust"])
 
     def test_batch_errors(self):
         code, _, err = run(["batch", str(self.dir / "없는폴더"), "--rect", "0,0,5,5"])

@@ -17,6 +17,7 @@ from typing import Callable, List, Optional, Tuple
 
 from . import __version__, api, settings
 from . import shapes as sh
+from .awake import KeepAwake
 from .batch import DEFAULT_OUTPUT_FOLDER, DEFAULT_WATCH_INTERVAL, BatchJob, BatchRunner
 from .photoshop import PhotoshopError, ScriptFailed
 
@@ -46,6 +47,12 @@ METHOD_HINTS = {
 
 ANCHOR_HELP = ("모서리의 워터마크나 날짜처럼 자리가 정해진 영역에 알맞습니다. 기준 위치에서 떨어진 거리를 지키므로, "
                "세로 사진이나 크기가 다른 사진에서도 같은 모서리에 놓입니다.")
+
+ADJUST_INTRO = (
+    "사진마다 똑같이 적용할 보정(예: 늘 쓰는 Camera Raw 필터 설정)을 Photoshop '동작'으로 한 번 녹화해 두면, "
+    "이 도구가 영역을 지운 다음 그 동작을 사진 전체에 적용하고 저장합니다. 폴더 자동 처리에서도 똑같이 적용됩니다."
+)
+ADJUST_HINT = "보정: 지운 다음 녹화해 둔 보정 동작을 사진 전체에 적용하고 저장합니다. 처음이면 보정 줄의 [설정...]을 보세요."
 
 ORIENTATION_HELP = ("가로 사진과 세로 사진에서 글씨 자리가 다르면, 다른 방향의 사진을 열어 그 사진에 맞게 그린 뒤 "
                     "같은 이름으로 한 번 더 저장하세요. 사진마다 방향에 맞는 영역을 알아서 고릅니다.")
@@ -82,6 +89,10 @@ HELP_TEXT = """\
 Photoshop 작업 표시줄의 [제거] 버튼으로 지우려면
   지우는 방식에서 'Photoshop [제거] 버튼'을 고르세요.
   처음 한 번은 [설정...]의 안내대로 [제거] 버튼 누르기를 동작으로 녹화해야 합니다.
+
+지운 뒤 Camera Raw 필터 같은 보정을 모든 사진에 똑같이 하려면
+  보정 줄의 [설정...] 안내대로 보정을 동작으로 한 번 녹화하고 '지운 뒤 보정 동작도 적용'을 켜세요.
+  [Photoshop에서 지우기]와 폴더 자동 처리에 적용됩니다.
 
 Photoshop의 선택 도구로 직접 고르고 싶다면
   ① [Photoshop에서 열기]로 사진을 엽니다. 영역을 그려 두었다면 그 영역이 선택된 채로 열립니다.
@@ -120,6 +131,12 @@ class RemoverApp:
         self.action_name = tk.StringVar(value=api.DEFAULT_ACTION_NAME)
         self.action_status = tk.StringVar()
         self._action_dialog: Optional[tk.Toplevel] = None
+        self.adjust = tk.BooleanVar(value=False)
+        self.adjust_set = tk.StringVar(value=api.DEFAULT_ACTION_SET)
+        self.adjust_name = tk.StringVar(value=api.DEFAULT_ADJUST_NAME)
+        self.adjust_status = tk.StringVar()
+        self._adjust_dialog: Optional[tk.Toplevel] = None
+        self._save_after: Optional[str] = None
         self.expand = tk.StringVar(value="4")
         self.feather = tk.StringVar(value="0")
         self.subject = tk.BooleanVar(value=False)
@@ -140,6 +157,10 @@ class RemoverApp:
         self._bind_keys()
         self._refresh_presets()
         self.method.trace_add("write", lambda *_: self._on_method_change())
+        self.adjust.trace_add("write", lambda *_: self.adjust.get() and self.status.set(ADJUST_HINT))
+        # Saved as they change: the folder watcher may be started on its own meanwhile.
+        for name in self._TEXT_PREFERENCES + self._FLAG_PREFERENCES:
+            getattr(self, name).trace_add("write", lambda *_: self._preferences_changed())
         self.output.trace_add("write", lambda *_: self._on_output_edited())
         self.brush_size.trace_add("write", lambda *_: self.brush_label.set(f"{self._brush_diameter()} px"))
         if photo:
@@ -228,15 +249,22 @@ class RemoverApp:
         ttk.Checkbutton(refine, text="그린 영역 안에서 Photoshop '피사체 선택'으로 대상만 고르기",
                         variable=self.subject).pack(side=tk.LEFT, padx=(16, 0))
 
-        ttk.Label(panel, text="저장 위치").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=(6, 0))
-        ttk.Entry(panel, textvariable=self.output).grid(row=2, column=1, sticky="ew", pady=(6, 0))
-        ttk.Button(panel, text="바꾸기...", command=self.choose_output).grid(row=2, column=2, padx=(6, 0), pady=(6, 0))
-        ttk.Checkbutton(panel, text="끝나면 결과를 Photoshop에 열어 두기",
-                        variable=self.keep_open).grid(row=2, column=3, sticky="w", padx=(12, 0), pady=(6, 0))
+        ttk.Label(panel, text="보정").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=(6, 0))
+        adjust = ttk.Frame(panel)
+        adjust.grid(row=2, column=1, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(adjust, text="지운 뒤 보정 동작도 적용 (Camera Raw 필터 등)",
+                        variable=self.adjust).pack(side=tk.LEFT)
+        ttk.Button(adjust, text="설정...", command=self.open_adjust_settings).pack(side=tk.LEFT, padx=(4, 0))
 
-        ttk.Label(panel, text="공통 영역").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=(6, 0))
+        ttk.Label(panel, text="저장 위치").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=(6, 0))
+        ttk.Entry(panel, textvariable=self.output).grid(row=3, column=1, sticky="ew", pady=(6, 0))
+        ttk.Button(panel, text="바꾸기...", command=self.choose_output).grid(row=3, column=2, padx=(6, 0), pady=(6, 0))
+        ttk.Checkbutton(panel, text="끝나면 결과를 Photoshop에 열어 두기",
+                        variable=self.keep_open).grid(row=3, column=3, sticky="w", padx=(12, 0), pady=(6, 0))
+
+        ttk.Label(panel, text="공통 영역").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=(6, 0))
         common = ttk.Frame(panel)
-        common.grid(row=3, column=1, columnspan=3, sticky="w", pady=(6, 0))
+        common.grid(row=4, column=1, columnspan=3, sticky="w", pady=(6, 0))
         self.preset_box = ttk.Combobox(common, textvariable=self.preset, state="readonly", width=18)
         self.preset_box.pack(side=tk.LEFT)
         ttk.Button(common, text="이 사진에 적용", command=self.apply_preset).pack(side=tk.LEFT, padx=(6, 0))
@@ -246,7 +274,7 @@ class RemoverApp:
                    command=self.open_batch_window).pack(side=tk.LEFT, padx=(16, 0))
 
         actions = ttk.Frame(panel)
-        actions.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        actions.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         self.run_button = ttk.Button(actions, text="▶  Photoshop에서 지우기", style="Accent.TButton",
                                      command=self.run_remove)
         self.run_button.pack(side=tk.LEFT)
@@ -540,6 +568,9 @@ class RemoverApp:
                 feather=float(self.feather.get() or 0),
                 subject=self.subject.get(),
                 keep_open=self.keep_open.get(),
+                adjust=self.adjust.get(),
+                adjust_set=self.adjust_set.get().strip(),
+                adjust_name=self.adjust_name.get().strip(),
             )
             options.validate()
         except ValueError as exc:
@@ -642,7 +673,8 @@ class RemoverApp:
             self.progress.pack_forget()
 
     def _removed(self, result: dict) -> None:
-        self._after_success(f"완료했습니다. 저장한 파일: {result.get('output')}", result)
+        done = "지우고 보정까지 했습니다" if result.get("adjustSteps") else "완료했습니다"
+        self._after_success(f"{done}. 저장한 파일: {result.get('output')}", result)
 
     def _removed_current(self, result: dict) -> None:
         text = "Photoshop에서 선택 영역을 지웠습니다. (Photoshop에서 Ctrl+Z로 되돌릴 수 있습니다)"
@@ -676,8 +708,9 @@ class RemoverApp:
 
     # ------------------------------------------------------ preferences
 
-    _TEXT_PREFERENCES = ("method", "action_set", "action_name", "expand", "feather", "preset")
-    _FLAG_PREFERENCES = ("subject", "keep_open")
+    _TEXT_PREFERENCES = ("method", "action_set", "action_name", "adjust_set", "adjust_name", "expand", "feather",
+                         "preset")
+    _FLAG_PREFERENCES = ("subject", "keep_open", "adjust")
 
     def _restore_preferences(self) -> None:
         saved = settings.load_settings("main")
@@ -696,7 +729,18 @@ class RemoverApp:
         except OSError:
             pass  # remembering the choices is a convenience
 
+    def _preferences_changed(self) -> None:
+        if self._save_after is not None:
+            self.root.after_cancel(self._save_after)
+        self._save_after = self.root.after(800, self._save_changed_preferences)
+
+    def _save_changed_preferences(self) -> None:
+        self._save_after = None
+        self.save_preferences()
+
     def close(self) -> None:
+        if self._save_after is not None:
+            self.root.after_cancel(self._save_after)
         self.save_preferences()
         self.root.destroy()
 
@@ -759,57 +803,79 @@ class RemoverApp:
 
     def open_action_settings(self) -> None:
         """Explain how to record the Remove button as an action, and check for it."""
-        if self._action_dialog is not None and self._action_dialog.winfo_exists():
-            self._action_dialog.lift()
-            return
+        self._action_dialog = self._recording_dialog(
+            self._action_dialog, "Photoshop [제거] 버튼 쓰기", ACTION_INTRO, api.ACTION_SETUP_HELP,
+            self.action_set, self.action_name, self.action_status, self.check_action)
+
+    def open_adjust_settings(self) -> None:
+        """Explain how to record the adjustment (e.g. a Camera Raw Filter), and check for it."""
+        self._adjust_dialog = self._recording_dialog(
+            self._adjust_dialog, "보정 동작 쓰기 (Camera Raw 필터 등)", ADJUST_INTRO, api.ADJUST_SETUP_HELP,
+            self.adjust_set, self.adjust_name, self.adjust_status, self.check_adjust)
+
+    def _recording_dialog(self, dialog: Optional[tk.Toplevel], title: str, intro: str, help_text: str,
+                          set_var: tk.StringVar, name_var: tk.StringVar, status_var: tk.StringVar,
+                          check: Callable[[], None]) -> tk.Toplevel:
+        if dialog is not None and dialog.winfo_exists():
+            dialog.lift()
+            return dialog
         dialog = tk.Toplevel(self.root)
-        dialog.title("Photoshop [제거] 버튼 쓰기")
+        dialog.title(title)
         dialog.transient(self.root)
         dialog.resizable(False, False)
-        self._action_dialog = dialog
         body = ttk.Frame(dialog, padding=16)
         body.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(body, text=ACTION_INTRO, justify="left", wraplength=560).grid(
-            row=0, column=0, columnspan=4, sticky="w")
-        ttk.Label(body, text=api.ACTION_SETUP_HELP, justify="left", wraplength=560).grid(
+        ttk.Label(body, text=intro, justify="left", wraplength=560).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(body, text=help_text, justify="left", wraplength=560).grid(
             row=1, column=0, columnspan=4, sticky="w", pady=(10, 12))
         ttk.Label(body, text="세트 이름").grid(row=2, column=0, sticky="w")
-        ttk.Entry(body, textvariable=self.action_set, width=18).grid(row=2, column=1, sticky="w", padx=(6, 16))
+        ttk.Entry(body, textvariable=set_var, width=18).grid(row=2, column=1, sticky="w", padx=(6, 16))
         ttk.Label(body, text="동작 이름").grid(row=2, column=2, sticky="w")
-        ttk.Entry(body, textvariable=self.action_name, width=18).grid(row=2, column=3, sticky="w", padx=(6, 0))
+        ttk.Entry(body, textvariable=name_var, width=18).grid(row=2, column=3, sticky="w", padx=(6, 0))
         buttons = ttk.Frame(body)
         buttons.grid(row=3, column=0, columnspan=4, sticky="w", pady=(12, 0))
-        ttk.Button(buttons, text="Photoshop에서 확인", command=self.check_action).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Photoshop에서 확인", command=check).pack(side=tk.LEFT)
         ttk.Button(buttons, text="닫기", command=dialog.destroy).pack(side=tk.LEFT, padx=(6, 0))
-        self.action_status.set("")
-        ttk.Label(body, textvariable=self.action_status, justify="left", wraplength=560).grid(
+        status_var.set("")
+        ttk.Label(body, textvariable=status_var, justify="left", wraplength=560).grid(
             row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        return dialog
 
     def check_action(self) -> None:
+        self._check_recorded(self.action_set, self.action_name, self.action_status,
+                             on_found=lambda: self.method.set("action"))
+
+    def check_adjust(self) -> None:
+        self._check_recorded(self.adjust_set, self.adjust_name, self.adjust_status,
+                             on_found=lambda: self.adjust.set(True))
+
+    def _check_recorded(self, set_var: tk.StringVar, name_var: tk.StringVar, status_var: tk.StringVar,
+                        on_found: Callable[[], None]) -> None:
         if self._busy:
             return
-        action_set, action_name = self.action_set.get().strip(), self.action_name.get().strip()
+        action_set, action_name = set_var.get().strip(), name_var.get().strip()
         if not action_set or not action_name:
-            self.action_status.set("세트 이름과 동작 이름을 입력하세요.")
+            status_var.set("세트 이름과 동작 이름을 입력하세요.")
             return
-        self.action_status.set("Photoshop에서 동작을 찾는 중입니다...")
+        status_var.set("Photoshop에서 동작을 찾는 중입니다...")
         self._start("Photoshop에서 동작을 찾는 중입니다...",
                     lambda: api.find_recorded_action(action_set, action_name),
-                    lambda info: self._action_checked(action_set, action_name, info))
+                    lambda info: self._action_checked(action_set, action_name, info, status_var, on_found))
 
-    def _action_checked(self, action_set: str, action_name: str, info: dict) -> None:
+    def _action_checked(self, action_set: str, action_name: str, info: dict, status_var: tk.StringVar,
+                        on_found: Callable[[], None]) -> None:
         label = f"'{action_set} > {action_name}'"
         if info.get("found") and info.get("stepCount") != 0:
             steps = ", ".join(info.get("steps") or []) or "(알 수 없음)"
             text = f"동작 {label}을(를) 찾았습니다. 녹화된 단계: {steps}"
-            self.method.set("action")
+            on_found()  # a working action is switched on for the user
         elif info.get("found"):
             text = f"동작 {label}에 녹화된 단계가 없습니다. 다시 녹화하세요."
         elif info.get("setFound"):
             text = f"'{action_set}' 세트는 있지만 '{action_name}' 동작이 없습니다."
         else:
             text = f"Photoshop에 '{action_set}' 세트가 없습니다. 위 방법대로 녹화하세요."
-        self.action_status.set(text)
+        status_var.set(text)
         self.status.set(text)
 
     # ------------------------------------------------------ selection files
@@ -951,6 +1017,7 @@ class BatchWindow:
 
     TITLE = "PS Remover 폴더 자동 처리"
     MAX_LOG_LINES = 2000
+    RESTART_SECONDS = 60  # after an unexpected error the watcher starts again by itself
 
     def __init__(self, master: tk.Misc, app: Optional[RemoverApp] = None, standalone: bool = False):
         self.app = app
@@ -969,6 +1036,11 @@ class BatchWindow:
         self.skip_done = tk.BooleanVar(value=saved.get("skip_done", True))
         self.watch = tk.BooleanVar(value=saved.get("watch", True))
         self.interval = tk.StringVar(value=f"{float(saved.get('interval', DEFAULT_WATCH_INTERVAL)):g}")
+        adjust = saved.get("adjust")
+        if not isinstance(adjust, bool):
+            adjust = bool(app.adjust.get() if app else main.get("adjust", False))
+        self.adjust = tk.BooleanVar(value=adjust)
+        self.adjust_info = tk.StringVar()
         self.autostart = tk.BooleanVar(value=saved.get("autostart", True))
         self.login_start = tk.BooleanVar(value=settings.starts_at_login())
         self.area_info = tk.StringVar()
@@ -976,11 +1048,20 @@ class BatchWindow:
         self._events: "queue.Queue" = queue.Queue()
         self._runner: Optional[BatchRunner] = None
         self._poll_after: Optional[str] = None
+        self._restart_after: Optional[str] = None
+        self._watching = False
+        self._user_stopped = False
+        self._start_problem: Optional[str] = None
+        self._awake = KeepAwake()
+        settings.prune_logs()
         self._build()
         self._show_area_info()
+        self._show_adjust_info()
         self.preset.trace_add("write", lambda *_: self._show_area_info())
-        # Common areas saved in the main window meanwhile show up here too.
-        self.window.bind("<FocusIn>", lambda e: self.preset_box.configure(values=settings.list_presets()), add="+")
+        # Someone is choosing a folder: stop trying the old one by itself.
+        self.input_dir.trace_add("write", lambda *_: self._cancel_restart())
+        # Changes made in the main window meanwhile show up here too.
+        self.window.bind("<FocusIn>", lambda e: self._refresh_from_main(), add="+")
 
     def _build(self) -> None:
         body = ttk.Frame(self.window, padding=12)
@@ -1016,8 +1097,15 @@ class BatchWindow:
         ttk.Spinbox(method_row, from_=0, to=100, width=4, textvariable=self.expand).pack(side=tk.LEFT, padx=(4, 2))
         ttk.Label(method_row, text="px").pack(side=tk.LEFT)
 
+        ttk.Label(body, text="보정").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        adjust_row = ttk.Frame(body)
+        adjust_row.grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Checkbutton(adjust_row, text="지운 뒤 보정 동작도 적용 (Camera Raw 필터 등)",
+                        variable=self.adjust).pack(side=tk.LEFT)
+        ttk.Label(adjust_row, textvariable=self.adjust_info, foreground="#666666").pack(side=tk.LEFT, padx=(10, 0))
+
         options = ttk.Frame(body)
-        options.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        options.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
         watch_row = ttk.Frame(options)
         watch_row.pack(anchor="w")
         ttk.Checkbutton(watch_row, text="새 사진이 들어오면 바로 지우기 (폴더 감시), 확인 간격",
@@ -1035,12 +1123,13 @@ class BatchWindow:
                             command=self._toggle_login_start).pack(side=tk.LEFT, padx=(16, 0))
 
         controls = ttk.Frame(body)
-        controls.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 6))
+        controls.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 6))
         self.start_button = ttk.Button(controls, text="▶  시작", style="Accent.TButton", command=self.start)
         self.start_button.pack(side=tk.LEFT)
         self.stop_button = ttk.Button(controls, text="멈춤", command=self.stop, state="disabled")
         self.stop_button.pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(controls, text="저장 폴더 열기", command=self.open_output).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(controls, text="기록 파일 열기", command=self.open_logs).pack(side=tk.LEFT, padx=(6, 0))
         self.progress = ttk.Progressbar(controls, mode="determinate", length=180)
         self.progress.pack(side=tk.RIGHT)
 
@@ -1071,6 +1160,24 @@ class BatchWindow:
             other = "세로" if this == "landscape" else "가로"
             self.area_info.set(f"{sh.ORIENTATION_LABELS[this]}용 영역만 있습니다 ({other} 사진에는 맞춰서 씁니다).")
 
+    def _adjust_names(self) -> Tuple[str, str]:
+        """The adjustment action set up in the main window."""
+        if self.app:
+            action_set, action_name = self.app.adjust_set.get(), self.app.adjust_name.get()
+        else:
+            main = settings.load_settings("main")
+            action_set, action_name = main.get("adjust_set"), main.get("adjust_name")
+        return (str(action_set or "").strip() or api.DEFAULT_ACTION_SET,
+                str(action_name or "").strip() or api.DEFAULT_ADJUST_NAME)
+
+    def _show_adjust_info(self) -> None:
+        action_set, action_name = self._adjust_names()
+        self.adjust_info.set(f"Photoshop 동작 '{action_set} > {action_name}'")
+
+    def _refresh_from_main(self) -> None:
+        self.preset_box.configure(values=settings.list_presets())
+        self._show_adjust_info()
+
     def _choose_dir(self, variable: tk.StringVar) -> None:
         path = filedialog.askdirectory(parent=self.window, initialdir=variable.get() or self.input_dir.get() or None)
         if path:
@@ -1092,11 +1199,15 @@ class BatchWindow:
         main = settings.load_settings("main")
         action_set = self.app.action_set.get() if self.app else main.get("action_set")
         action_name = self.app.action_name.get() if self.app else main.get("action_name")
+        adjust_set, adjust_name = self._adjust_names()
         return api.RemoveOptions(
             method=self.method.get(),
             action_set=(action_set or api.DEFAULT_ACTION_SET).strip(),
             action_name=(action_name or api.DEFAULT_ACTION_NAME).strip(),
             expand=int(float(self.expand.get() or 0)),
+            adjust=self.adjust.get(),
+            adjust_set=adjust_set,
+            adjust_name=adjust_name,
         )
 
     @property
@@ -1107,6 +1218,7 @@ class BatchWindow:
         """Start processing; ``quiet`` reports problems in the window instead of dialogs."""
         if self.running:
             return True
+        self._cancel_restart()
         problem = None
         if not self.preset.get():
             problem = "지울 공통 영역을 고르세요." if settings.list_presets() else BATCH_NO_PRESET
@@ -1131,8 +1243,12 @@ class BatchWindow:
         self._save_settings()
         self._runner = BatchRunner(job, self._events.put)
         watch = self.watch.get()
-        mode = "새 사진이 들어오면 바로 지웁니다" if watch else "지금 있는 사진만 지웁니다"
-        self._log(f"시작: {job.input_dir} → {job.output_dir} ('{self.preset.get()}', {mode})")
+        self._watching, self._user_stopped = watch, False
+        mode = "새 사진이 들어오면 바로 처리" if watch else "지금 있는 사진만 처리"
+        steps = "지우기 + 보정" if options.adjust else "지우기"
+        self._log(f"시작: {job.input_dir} → {job.output_dir} ('{self.preset.get()}', {mode}, {steps})")
+        if watch and self._awake.start():
+            self._log("자동 처리 중에는 컴퓨터가 절전 모드로 들어가지 않습니다. (화면은 꺼질 수 있습니다)")
         self._set_running(True)
         threading.Thread(target=self._run, args=(self._runner, watch, interval), daemon=True).start()
         self._poll_after = self.window.after(150, self._poll)
@@ -1143,12 +1259,39 @@ class BatchWindow:
             runner.run(watch=watch, interval=interval)
         except Exception as exc:  # noqa: BLE001 - shown in the log instead of vanishing with the thread
             self._events.put({"type": "finished", "done": runner.done, "failed": len(runner.failed),
-                              "error": f"예상하지 못한 오류: {exc!r}"})
+                              "error": f"예상하지 못한 오류: {exc!r}", "crashed": True})
 
     def stop(self) -> None:
+        self._user_stopped = True
+        self._cancel_restart()
         if self._runner is not None:
             self._runner.stop()
             self.status.set("지금 처리 중인 사진을 끝내고 멈춥니다...")
+
+    def _cancel_restart(self) -> None:
+        if self._restart_after is not None:
+            self.window.after_cancel(self._restart_after)
+            self._restart_after = None
+
+    def _restart(self) -> None:
+        self._log("다시 시작합니다.")
+        self.start_unattended()
+
+    def start_unattended(self) -> None:
+        """Start without dialogs, e.g. at sign-in. A photo folder that is not there yet
+        (a network drive still connecting, a USB disk) is tried again every minute."""
+        self._restart_after = None
+        if self.start(quiet=True):
+            self._start_problem = None
+            return
+        folder = self.input_dir.get().strip()
+        if not folder or Path(folder).is_dir():
+            return  # the user has to choose something: the window says what
+        problem = self.status.get()
+        if problem != self._start_problem:
+            self._log(f"시작하지 못했습니다: {problem} ({self.RESTART_SECONDS}초마다 다시 시도합니다)")
+            self._start_problem = problem
+        self._restart_after = self.window.after(int(self.RESTART_SECONDS * 1000), self.start_unattended)
 
     def _poll(self) -> None:
         self._poll_after = None
@@ -1170,7 +1313,10 @@ class BatchWindow:
             self.progress.configure(value=float(self.progress.cget("value")) + 1)
             result = event["result"]
             used = result.get("areaUsed")
-            which = f" ({sh.ORIENTATION_LABELS[used]}용 영역)" if used in sh.ORIENTATION_LABELS else ""
+            notes = [f"{sh.ORIENTATION_LABELS[used]}용 영역"] if used in sh.ORIENTATION_LABELS else []
+            if result.get("adjustSteps"):
+                notes.append("보정")
+            which = f" ({', '.join(notes)})" if notes else ""
             self._log(f"완료  {event['photo'].name} → {Path(result.get('output') or '').name}{which}")
             for warning in result.get("warnings") or []:
                 self._log(f"      참고: {warning}")
@@ -1180,13 +1326,14 @@ class BatchWindow:
         elif kind == "error":
             self._log(f"오류  {event['error']}")
             if event.get("retry"):
-                self._log("      Photoshop 문제를 해결하면 저절로 다시 이어서 지웁니다.")
-                self.status.set("Photoshop 문제로 멈춰 있습니다. 기록의 안내를 확인하세요. 해결되면 저절로 이어서 지웁니다.")
+                self._log("      이 문제를 해결하면 저절로 다시 이어서 처리합니다.")
+                self.status.set("문제가 있어 기다리는 중입니다. 기록의 안내를 확인하세요. 해결되면 저절로 이어서 처리합니다.")
         elif kind == "waiting":
             self._log("새 사진을 기다리는 중...")
             self.status.set("새 사진을 기다리고 있습니다. 사진 폴더에 사진이 들어오면 바로 지웁니다.")
         elif kind == "finished":
             self._runner = None
+            self._awake.stop()
             self._set_running(False)
             summary = f"끝났습니다: {event['done']}장 완료, {event['failed']}장 실패"
             if event.get("error"):
@@ -1195,8 +1342,13 @@ class BatchWindow:
                 summary = "새로 지울 사진이 없습니다."
             self._log(summary)
             self.status.set(summary)
+            if event.get("crashed") and self._watching and not self._user_stopped:
+                # Nobody may be watching the screen: carry on by itself.
+                self._log(f"{self.RESTART_SECONDS}초 뒤에 다시 시작합니다.")
+                self._restart_after = self.window.after(int(self.RESTART_SECONDS * 1000), self._restart)
 
     def _log(self, text: str) -> None:
+        settings.append_log(text)
         self.log.configure(state="normal")
         self.log.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n")
         lines = int(self.log.index("end-1c").split(".")[0])
@@ -1221,13 +1373,21 @@ class BatchWindow:
             return
         open_folder(folder)
 
+    def open_logs(self) -> None:
+        folder = settings.log_dir()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        open_folder(folder)
+
     def _save_settings(self) -> None:
         try:
             settings.save_settings("batch", {
                 "preset": self.preset.get(), "input_dir": self.input_dir.get().strip(),
                 "output_dir": self.output_dir.get().strip(), "method": self.method.get(),
-                "expand": self.expand.get(), "skip_done": self.skip_done.get(), "watch": self.watch.get(),
-                "interval": self.interval.get(), "autostart": self.autostart.get(),
+                "expand": self.expand.get(), "adjust": self.adjust.get(), "skip_done": self.skip_done.get(),
+                "watch": self.watch.get(), "interval": self.interval.get(), "autostart": self.autostart.get(),
             })
         except OSError:
             pass  # remembering the choices is a convenience
@@ -1237,6 +1397,8 @@ class BatchWindow:
             if not messagebox.askyesno(self.TITLE, "처리를 멈추고 창을 닫을까요?", parent=self.window):
                 return
             self.stop()  # the photo in progress finishes in the background
+        self._cancel_restart()
+        self._awake.stop()
         if self._poll_after is not None:
             self.window.after_cancel(self._poll_after)
         self._save_settings()
@@ -1368,7 +1530,7 @@ def watch_main(start: bool = False) -> int:
     _setup_style(root)
     window = BatchWindow(root, standalone=True)
     if start or window.autostart.get():
-        root.after(300, lambda: window.start(quiet=True))
+        root.after(300, window.start_unattended)
     root.mainloop()
     return 0
 

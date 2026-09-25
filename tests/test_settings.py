@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -60,6 +61,20 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.load_settings("batch"), {})
         settings.save_settings("batch", {"a": 1})  # recovers from a broken file
         self.assertEqual(settings.load_settings("batch"), {"a": 1})
+
+    def test_watcher_log(self):
+        day = time.mktime((2026, 9, 25, 13, 5, 9, 0, 0, -1))
+        settings.append_log("완료  a.jpg → a_removed.jpg", now=day)
+        settings.append_log("여러 줄\n오류", now=day + 1)
+        path = settings.log_dir() / "auto-2026-09-25.log"
+        self.assertEqual(path.read_text(encoding="utf-8"),
+                         "[2026-09-25 13:05:09] 완료  a.jpg → a_removed.jpg\n[2026-09-25 13:05:10] 여러 줄\n오류\n")
+        old = settings.log_dir() / "auto-2026-08-01.log"
+        old.write_text("x", encoding="utf-8")
+        os.utime(old, (day - 40 * 86400, day - 40 * 86400))
+        os.utime(path, (day, day))
+        settings.prune_logs(now=day)
+        self.assertEqual([p.name for p in settings.log_dir().iterdir()], ["auto-2026-09-25.log"])
 
     def test_start_at_login_is_windows_only(self):
         with mock.patch.object(settings.sys, "platform", "linux"):

@@ -250,6 +250,109 @@ class BatchRunnerTests(BatchTestCase):
         self.assertEqual([w for w in waits if w >= 5], [5, 10, 20, 40, 60, 60])  # doubling, at most a minute
         self.assertEqual((runner._retries, runner._last_error), (0, None))  # a success starts over
 
+    def run_until_done(self, job, remove, done=1):
+        """Watch mode with instant waits, until ``done`` photos went through; returns the events and waits."""
+        events, waits = [], []
+        runner = batch.BatchRunner(job, events.append, remove=remove)
+        real_wait = runner._stop.wait
+
+        def wait(timeout=None):
+            waits.append(timeout)
+            if runner.done >= done or len(waits) > 100:
+                runner.stop()
+            return real_wait(0)
+
+        runner._stop.wait = wait
+        runner.run(watch=True, interval=1)
+        return runner, events, waits
+
+    def test_missing_recorded_action_waits_instead_of_failing_the_photo(self):
+        self.photo("a.jpg")
+        missing = ScriptFailed("Photoshop 동작 'ps-remover > 보정'을(를) 찾을 수 없습니다.",
+                               {"ok": False, "setupProblem": True})
+        remove = FakeRemove({"a.jpg": [missing, missing]})
+        runner, events, _ = self.run_until_done(self.job(), remove)
+        self.assertEqual(runner.done, 1)  # went through once the action was recorded
+        self.assertEqual(runner.failed, set())
+        self.assertEqual([e["error"] for e in events if e["type"] == "error"], [str(missing)])  # said once
+        # A single run stops at once: the next photos would fail the same way.
+        self.photo("b.jpg")
+        self.photo("c.jpg")
+        remove = FakeRemove({"b.jpg": [missing]})
+        runner, events = self.run_job(self.job(), remove)
+        self.assertEqual([c["photo"] for c in remove.calls], ["b.jpg"])
+        self.assertEqual(events[-1]["error"], str(missing))
+        self.assertEqual(events[-1]["failed"], 0)
+
+    def test_folder_that_goes_away_for_a_while(self):
+        self.photo("a.jpg")
+        job = self.job()
+        real_candidates = job.candidates
+        looks = []
+
+        def flaky(skip=()):
+            looks.append(1)
+            if len(looks) <= 2:
+                raise OSError("네트워크 드라이브에 연결할 수 없습니다")
+            return real_candidates(skip)
+
+        job.candidates = flaky
+        runner, events, waits = self.run_until_done(job, FakeRemove())
+        self.assertEqual(runner.done, 1)
+        errors = [e for e in events if e["type"] == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("사진 폴더를 읽을 수 없습니다", errors[0]["error"])
+        self.assertTrue(errors[0]["retry"])
+        self.assertEqual(waits[:2], [5, 10])
+        # A single run ends with the error instead.
+        job.candidates = lambda skip=(): (_ for _ in ()).throw(OSError("없음"))
+        _, events = self.run_job(job, FakeRemove())
+        self.assertIn("사진 폴더를 읽을 수 없습니다", events[-1]["error"])
+
+    def test_trouble_that_comes_back_later_is_reported_again(self):
+        job = self.job()
+        looks = []
+
+        def candidates(skip=()):
+            looks.append(1)
+            if len(looks) in (1, 3):  # away, back (nothing to do), away again
+                raise OSError("네트워크 드라이브에 연결할 수 없습니다")
+            return []
+
+        job.candidates = candidates
+        events, waits = [], []
+        runner = batch.BatchRunner(job, events.append, remove=FakeRemove())
+        real_wait = runner._stop.wait
+
+        def wait(timeout=None):
+            waits.append(timeout)
+            if len(looks) >= 4:
+                runner.stop()
+            return real_wait(0)
+
+        runner._stop.wait = wait
+        runner.run(watch=True, interval=1)
+        self.assertEqual(len([e for e in events if e["type"] == "error"]), 2)
+        self.assertEqual(waits[:3], [5, 1, 5])  # the wait starts short again too
+
+    def test_output_folder_that_cannot_be_made(self):
+        self.photo("a.jpg")
+        remove = FakeRemove()
+        job = self.job(output_dir=self.dir / "결과")
+        real_mkdir = Path.mkdir
+        tries = []
+
+        def mkdir(path, *args, **kwargs):
+            tries.append(path)
+            if len(tries) == 1:
+                raise PermissionError("권한 없음")
+            return real_mkdir(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "mkdir", mkdir):
+            runner, events, _ = self.run_until_done(job, remove)
+        self.assertIn("저장 폴더를 만들 수 없습니다", [e for e in events if e["type"] == "error"][0]["error"])
+        self.assertEqual(runner.done, 1)
+
     def test_stop_before_next_photo(self):
         for name in ("a.jpg", "b.jpg", "c.jpg"):
             self.photo(name)

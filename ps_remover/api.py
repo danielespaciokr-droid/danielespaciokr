@@ -14,6 +14,7 @@ from .shapes import Area, AreaSet, area_has_shapes, selection_ops
 METHODS = ("content-aware", "action", "transparent")
 DEFAULT_ACTION_SET = "ps-remover"
 DEFAULT_ACTION_NAME = "제거"
+DEFAULT_ADJUST_NAME = "보정"
 
 # Photoshop cannot press Contextual Task Bar buttons from a script, but it can
 # play an Action in which the user recorded pressing one.
@@ -26,6 +27,18 @@ Photoshop 작업 표시줄의 [제거] 버튼을 쓰려면 Photoshop에서 한 �
   4. + 아이콘(새 동작 만들기)을 누르고 이름을 '{DEFAULT_ACTION_NAME}'로 한 뒤 [기록]을 누릅니다.
   5. 작업 표시줄의 [제거] 버튼을 누르고, 결과가 나오면 동작 패널의 정지(■) 버튼을 누릅니다.
   6. 동작 패널의 '{DEFAULT_ACTION_NAME}' 아래에 단계가 생겼으면 끝입니다. 연습한 사진은 저장하지 않고 닫습니다."""
+# The same adjustment for every photo after the removal: Photoshop keeps the
+# settings of a recorded Camera Raw Filter step and applies them when played.
+ADJUST_SETUP_HELP = f"""\
+지운 뒤 모든 사진에 같은 보정(Camera Raw 필터 등)을 하려면 Photoshop에서 한 번만 녹화해 두세요:
+  1. Photoshop에서 아무 사진이나 엽니다. 선택 영역이 있으면 Ctrl+D로 해제합니다.
+  2. [창 > 동작](Alt+F9)에서 '{DEFAULT_ACTION_SET}' 세트를 누르고 + 아이콘(새 동작 만들기)을 누릅니다.
+  3. 이름을 '{DEFAULT_ADJUST_NAME}'으로 하고 [기록]을 누릅니다.
+  4. [필터 > Camera Raw 필터](Shift+Ctrl+A)에서 늘 쓰는 설정이나 사전 설정을 적용하고 [확인]을 누릅니다.
+  5. 동작 패널의 정지(■) 버튼을 누릅니다. '{DEFAULT_ADJUST_NAME}' 아래에 'Camera Raw 필터' 단계가 생기면 끝입니다.
+  6. 연습한 사진은 저장하지 않고 닫습니다.
+단계 왼쪽의 대화상자 칸은 비워 두세요. 켜 두면 사진마다 Camera Raw 창이 열려 자동 처리가 멈춥니다.
+설정을 바꾸려면 '{DEFAULT_ADJUST_NAME}' 동작을 지우고 다시 녹화하세요."""
 SAVE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".psd")
 TRANSPARENCY_EXTENSIONS = (".png", ".tif", ".tiff", ".psd")
 DEFAULT_SUFFIX = "_removed"
@@ -48,12 +61,17 @@ class RemoveOptions:
     subject: bool = False          # keep only what Photoshop's Select Subject finds inside the area
     keep_open: bool = True         # open the result in Photoshop afterwards
     jpeg_quality: int = 12         # 0-12, Photoshop's JPEG quality scale
+    adjust: bool = False           # then play a recorded action on the whole photo, e.g. a Camera Raw Filter
+    adjust_set: str = DEFAULT_ACTION_SET
+    adjust_name: str = DEFAULT_ADJUST_NAME
 
     def validate(self) -> None:
         if self.method not in METHODS:
             raise JobError(f"제거 방식은 {', '.join(METHODS)} 중 하나여야 합니다: {self.method!r}")
         if self.method == "action" and not (self.action_set.strip() and self.action_name.strip()):
             raise JobError("실행할 Photoshop 동작의 세트 이름과 동작 이름을 입력하세요.")
+        if self.adjust and not (self.adjust_set.strip() and self.adjust_name.strip()):
+            raise JobError("보정에 쓸 Photoshop 동작의 세트 이름과 동작 이름을 입력하세요.")
         if not 0 <= self.expand <= 100:
             raise JobError("선택 영역 확장은 0~100 픽셀이어야 합니다.")
         if not 0 <= self.feather <= 250:
@@ -105,6 +123,8 @@ def build_remove_config(photo, output, area: Union[Area, AreaSet], options: Opti
         "method": options.method,
         "actionSet": options.action_set,
         "actionName": options.action_name,
+        "adjustSet": options.adjust_set.strip() if options.adjust else None,
+        "adjustName": options.adjust_name.strip() if options.adjust else None,
         "expand": int(options.expand),
         "feather": float(options.feather),
         "keepOpen": bool(options.keep_open),

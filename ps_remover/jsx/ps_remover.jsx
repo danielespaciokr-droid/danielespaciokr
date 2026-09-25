@@ -12,7 +12,9 @@
  *
  * Photoshop has no scripting command for the Contextual Task Bar's Remove
  * button, so method "action" plays an Action in which the user recorded a
- * click on that button (or any other removal they prefer).
+ * click on that button (or any other removal they prefer). An adjustment the
+ * user recorded the same way, e.g. a Camera Raw Filter with their settings,
+ * can then be played on the whole photo before it is saved.
  *
  * ExtendScript implements ECMAScript 3: there is no JSON object, no
  * Array.prototype.forEach/map/indexOf, no String.prototype.trim, and reserved
@@ -35,6 +37,8 @@ var PSR_DEFAULTS = {
     method: "content-aware",    // "content-aware" | "action" | "transparent"
     actionSet: "ps-remover",    // method "action": the recorded Photoshop action to play,
     actionName: "제거",          // e.g. a click on the Contextual Task Bar's Remove button
+    adjustSet: "ps-remover",    // "remove": then play this recorded action on the whole photo before
+    adjustName: null,           //   saving, e.g. a Camera Raw Filter (null: no adjustment)
     expand: 4,                  // grow the selection by this many pixels first
     feather: 0,                 // feather radius in pixels
     keepOpen: true,             // show the result in Photoshop afterwards
@@ -76,6 +80,7 @@ function psrRun(rawConfig) {
     } catch (e) {
         result.ok = false;
         result.error = psrDescribeError(e);
+        if (e && e.psrSetup) result.setupProblem = true;
         psrAfterError(cfg, job, result);
     }
     if (settings) psrPopSettings(settings);
@@ -88,6 +93,9 @@ function psrRun(rawConfig) {
 function psrActionRemove(cfg, result, job) {
     var file = psrInputFile(cfg);
     if (!cfg.output) throw psrError("결과를 저장할 경로가 지정되지 않았습니다.");
+    // Without the recorded actions there is no point in opening the photo.
+    if (cfg.method == "action") psrRequireAction(cfg.actionSet, cfg.actionName, "remove");
+    if (cfg.adjustName) psrRequireAction(cfg.adjustSet, cfg.adjustName, "adjust");
 
     var countBefore = app.documents.length;
     var doc = app.open(file);
@@ -110,6 +118,7 @@ function psrActionRemove(cfg, result, job) {
         result.selectionBounds = psrSelectionBounds(doc);
         psrRemoveSelected(doc, cfg, result);
     });
+    if (cfg.adjustName) psrAdjust(doc, cfg, result);
 
     var saved = psrSave(doc, cfg.output, cfg, result);
     result.output = saved.fsName;
@@ -491,7 +500,7 @@ function psrRemoveSelected(doc, cfg, result) {
     } else if (method == "content-aware") {
         psrContentAwareFill();
     } else if (method == "action") {
-        result.actionSteps = psrPlayRecordedAction(cfg.actionSet, cfg.actionName);
+        result.actionSteps = psrPlayRecordedAction(cfg.actionSet, cfg.actionName, "remove");
     } else {
         throw psrError("알 수 없는 제거 방식입니다: " + method);
     }
@@ -510,20 +519,46 @@ function psrContentAwareFill() {
 // --------------------------------------------------------- recorded actions
 
 // Play a recorded action on the current selection; returns its step names.
-function psrPlayRecordedAction(setName, actionName) {
-    var info = psrFindRecordedAction(setName, actionName);
-    var label = "'" + setName + " > " + actionName + "'";
-    if (!info.found) {
-        throw psrError("Photoshop 동작 " + label + "을(를) 찾을 수 없습니다. 동작 패널에서 '" + setName +
-            "' 세트 안에 '" + actionName + "' 동작을 만들고, 선택 영역이 있는 상태에서 작업 표시줄의 [제거] 버튼을 " +
-            "누르는 것을 녹화하세요.");
+// Play the adjustment the user recorded (e.g. a Camera Raw Filter) on the whole photo.
+function psrAdjust(doc, cfg, result) {
+    app.activeDocument = doc;
+    doc.selection.deselect(); // a filter would only change the selected part
+    if (doc.layers.length > 1) {
+        // e.g. the layer the Remove button made: the filter has to see the whole picture
+        try {
+            doc.mergeVisibleLayers();
+        } catch (e) {
+            doc.flatten();
+        }
     }
-    if (info.stepCount === 0) {
-        throw psrError("동작 " + label + "에 녹화된 단계가 없습니다. 녹화 중에 [제거] 버튼을 눌렀는데도 단계가 " +
-            "생기지 않았다면, 이 Photoshop 버전은 그 버튼을 동작으로 녹화할 수 없습니다.");
-    }
+    result.adjustSteps = psrPlayRecordedAction(cfg.adjustSet, cfg.adjustName, "adjust");
+}
+
+// purpose: "remove" (the Remove button) or "adjust" (e.g. a Camera Raw Filter)
+function psrPlayRecordedAction(setName, actionName, purpose) {
+    var info = psrRequireAction(setName, actionName, purpose);
     app.doAction(actionName, setName);
     return info.steps;
+}
+
+// The action's info, or an error that tells how to record it.
+function psrRequireAction(setName, actionName, purpose) {
+    var info = psrFindRecordedAction(setName, actionName);
+    var label = "'" + setName + " > " + actionName + "'";
+    var adjust = purpose == "adjust";
+    if (!info.found) {
+        throw psrSetupError("Photoshop 동작 " + label + "을(를) 찾을 수 없습니다. 동작 패널에서 '" + setName +
+            "' 세트 안에 '" + actionName + "' 동작을 만들고, " + (adjust
+                ? "Camera Raw 필터 등 보정 작업을 녹화하세요."
+                : "선택 영역이 있는 상태에서 작업 표시줄의 [제거] 버튼을 누르는 것을 녹화하세요."));
+    }
+    if (info.stepCount === 0) {
+        throw psrSetupError("동작 " + label + "에 녹화된 단계가 없습니다. " + (adjust
+            ? "[기록]을 누른 뒤 [필터 > Camera Raw 필터]를 적용하고 정지(■)를 누르세요."
+            : "녹화 중에 [제거] 버튼을 눌렀는데도 단계가 생기지 않았다면, 이 Photoshop 버전은 그 버튼을 " +
+              "동작으로 녹화할 수 없습니다."));
+    }
+    return info;
 }
 
 // Look an action up in the Actions panel. Sets, actions and their steps are
@@ -748,6 +783,13 @@ function psrError(message) {
     return error;
 }
 
+// Something to set up once (e.g. a recorded action), not a problem with the photo.
+function psrSetupError(message) {
+    var error = psrError(message);
+    error.psrSetup = true;
+    return error;
+}
+
 function psrDescribeError(e) {
     if (e && e.psrFriendly) return e.message;
     var text = (e && e.message) ? String(e.message) : String(e);
@@ -768,6 +810,7 @@ function psrAlertResult(result) {
             : "동작을 찾지 못했습니다.";
     } else {
         message = "선택 영역을 제거했습니다.";
+        if (result.adjustSteps) message += "\n보정 동작도 적용했습니다.";
         if (result.output) message += "\n저장 위치: " + result.output;
     }
     for (var i = 0; i < result.warnings.length; i++) message += "\n- " + result.warnings[i];
