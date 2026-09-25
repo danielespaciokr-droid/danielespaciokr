@@ -20,7 +20,8 @@ DEFAULT_ACTION_NAME = "제거"
 ACTION_SETUP_HELP = f"""\
 Photoshop 작업 표시줄의 [제거] 버튼을 쓰려면 한 번만 동작으로 녹화해 두세요:
   1. Photoshop에서 아무 사진이나 열고 지울 부분을 선택합니다.
-  2. [창 > 동작]을 열고, 새 세트를 '{DEFAULT_ACTION_SET}' 이름으로 만듭니다.
+  2. [창 > 동작]을 엽니다 (단축키 Windows: Alt+F9, macOS: Option+F9).
+     동작 패널 아래의 폴더 아이콘을 눌러 새 세트를 '{DEFAULT_ACTION_SET}' 이름으로 만듭니다.
   3. 그 세트에 새 동작을 '{DEFAULT_ACTION_NAME}' 이름으로 만들고 [기록]을 누릅니다.
   4. 작업 표시줄의 [제거] 버튼을 누르고, 결과가 나오면 동작 패널의 정지(■) 버튼을 누릅니다."""
 SAVE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".psd")
