@@ -1,0 +1,8 @@
+{
+  "name": "ps-remover-jsx-tests",
+  "private": true,
+  "description": "Optional helper for tests/test_jsx_engine.py: acorn checks that ps_remover.jsx is valid ECMAScript 3 (ExtendScript).",
+  "devDependencies": {
+    "acorn": "^8.11.0"
+  }
+}

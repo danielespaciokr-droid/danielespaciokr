@@ -1,0 +1,4 @@
+Pillow>=8.0
+pywin32>=300; sys_platform == "win32"
+# 아이폰 HEIC 사진을 미리 보려면 아래 줄의 # 를 지우세요.
+# pillow-heif>=0.10

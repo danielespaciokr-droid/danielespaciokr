@@ -1,0 +1,192 @@
+# PS Remover: 포토샵으로 사진 속 영역 지우기
+
+Photoshop을 자동으로 실행해서 **사진을 열고, 지정한 영역을 선택하고, 그 부분을 지운 뒤, 결과를 새 파일로 저장**하는 도구입니다.
+
+- 지우는 방식은 둘 중 하나를 고릅니다.
+  - **내용 인식 채우기(Content-Aware Fill)**: 주변 내용으로 자연스럽게 채웁니다. 기본값입니다.
+  - **투명하게 잘라내기**: 선택한 부분을 투명하게 만들고 PNG로 저장합니다.
+- 원본 사진은 바뀌지 않습니다. 결과는 `사진이름_removed.jpg` 같은 새 파일로 저장됩니다.
+
+![PS Remover 화면](docs/screenshot.png)
+
+## 주요 기능
+
+- **사진 위에 지울 부분 그리기**: 사각형, 타원, 올가미, 브러시 도구와 추가/빼기, 되돌리기
+- **버튼 한 번으로 처리**: Photoshop 실행 → 사진 열기 → 같은 영역 선택 → 지우기 → 저장 → 결과를 Photoshop에 열어 두기
+- **선택 다듬기**: 넓히기(px)로 가장자리의 잔상까지 지우고, 부드럽게(페더)로 경계를 자연스럽게 합니다.
+- **피사체 선택(AI)과 함께 쓰기**: 대충 그린 영역 안에서 Photoshop의 '피사체 선택'이 찾은 대상의 윤곽만 지웁니다.
+- **Photoshop에서 직접 선택하기**: ① 사진을 Photoshop에서 열고, Photoshop의 선택 도구로 고른 뒤, ② 버튼을 누르면 지워집니다. 지우기는 한 단계로 기록되므로 Photoshop에서 Ctrl+Z 한 번으로 되돌릴 수 있습니다.
+- **명령줄(CLI)**: 좌표로 영역을 지정하고, 같은 위치의 워터마크나 날짜 표시를 여러 사진에서 한 번에 지웁니다.
+- **Photoshop 스크립트(.jsx)로 내보내기**: 자동 실행이 막힌 컴퓨터에서는 Photoshop 메뉴에서 직접 실행할 수 있습니다.
+
+## 준비물
+
+| 항목 | 내용 |
+| --- | --- |
+| 운영체제 | Windows 10/11 또는 macOS |
+| Photoshop | Adobe Photoshop CC 이상 (최신 버전 권장). '피사체 선택'은 CC 2018 이상 |
+| Python | 3.8 이상. [python.org](https://www.python.org/downloads/) 설치본을 권장합니다 (Tkinter 포함). Windows에서는 설치할 때 **Add python.exe to PATH**를 체크하세요. |
+
+## 설치와 실행
+
+### 가장 간단한 방법
+
+- **Windows**: `run_windows.bat`을 더블클릭합니다.
+- **macOS**: `run_mac.command`를 더블클릭합니다. 처음에는 Finder에서 오른쪽 클릭 → **열기**를 선택해야 할 수 있습니다.
+
+처음 실행하면 필요한 패키지(Pillow, Windows에서는 pywin32)를 설치하고 화면을 엽니다.
+
+### 직접 설치
+
+```bash
+pip install -r requirements.txt
+python -m ps_remover            # GUI 실행
+```
+
+또는 패키지로 설치하면 `ps-remover` 명령이 생깁니다.
+
+```bash
+pip install .
+ps-remover                      # GUI 실행
+```
+
+> macOS의 Homebrew Python에서 `externally-managed-environment` 오류가 나면 가상 환경을 쓰세요.
+> `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
+> Homebrew Python에는 Tkinter가 따로 필요합니다: `brew install python-tk`
+
+## 사용법 (GUI)
+
+1. **[사진 열기]** 로 사진을 고릅니다.
+2. 도구를 골라 사진 위에 지울 부분을 그립니다. 선택한 부분은 빨갛게 표시됩니다.
+   - **사각형(R)**, **타원(E)**: 드래그합니다. Shift를 누르면 정사각형이나 원이 됩니다.
+   - **올가미(L)**: 지울 부분을 자유롭게 둘러쌉니다.
+   - **브러시(B)**: 지울 부분을 칠합니다. `[` `]` 키로 브러시 크기를 바꿉니다.
+   - **빼기**를 고른 뒤 그리면 그 부분은 선택에서 빠집니다.
+   - 되돌리기는 Ctrl+Z (macOS는 Cmd+Z)입니다.
+3. 필요하면 옵션을 바꿉니다.
+   - **넓히기**: 선택 영역을 몇 픽셀 넓힌 뒤 지웁니다. 물체 가장자리가 남으면 값을 키우세요. 기본값은 4입니다.
+   - **부드럽게**: 경계를 부드럽게 합니다.
+   - **피사체 선택**: 그린 영역 안에서 Photoshop이 찾은 대상(사람, 물건)만 지웁니다.
+4. **[▶ Photoshop에서 지우기]** 를 누릅니다. Photoshop이 실행되어 작업하고, 결과를 저장한 뒤 Photoshop에 열어 둡니다.
+
+Photoshop의 선택 도구(개체 선택, 빠른 선택 등)를 쓰고 싶다면 **[① Photoshop에서 열기]** 를 누르고, Photoshop에서 지울 부분을 선택한 뒤 **[② Photoshop 선택 영역 지우기]** 를 누르세요.
+
+**[파일] 메뉴**에서 선택 영역을 저장하거나 불러올 수 있고, Photoshop 스크립트(.jsx)로 내보낼 수도 있습니다.
+
+## 사용법 (명령줄)
+
+좌표는 **픽셀** 단위이고 (0, 0)은 사진의 **왼쪽 위**입니다. 사각형과 타원은 `X,Y,너비,높이`로 씁니다.
+Photoshop에서 사각형 선택 도구로 드래그하면 정보 패널에 X, Y, W, H가 표시됩니다.
+
+```bash
+# 사각형 영역을 내용 인식 채우기로 지우기 → 사진_removed.jpg
+ps-remover remove 사진.jpg --rect 120,80,300,200
+
+# 여러 도형 섞기 (타원, 다각형)
+ps-remover remove 사진.jpg --ellipse 50,60,40,40 --polygon "10,10 90,15 60,80"
+
+# 투명하게 잘라내서 PNG로 저장, 선택 영역은 10픽셀 넓히기
+ps-remover remove 사진.jpg --rect 0,0,200,100 --method transparent --expand 10
+
+# 사진 속 주요 대상(피사체)을 찾아 지우기
+ps-remover remove 인물.jpg --subject
+
+# 같은 위치의 워터마크를 여러 사진에서 지우기 (GUI에서 저장한 선택 영역 사용)
+ps-remover remove "사진/*.jpg" --selection 워터마크.json --output-dir 결과
+
+# Photoshop에서 사진만 열기 / Photoshop에서 직접 선택한 영역 지우기
+ps-remover open 사진.jpg
+ps-remover remove-selection --output 결과.png
+```
+
+`python -m ps_remover remove ...`처럼 실행해도 됩니다. 모든 옵션은 `ps-remover remove --help`로 볼 수 있습니다.
+
+| 옵션 | 설명 |
+| --- | --- |
+| `--rect`, `--ellipse` `X,Y,W,H` | 사각형, 타원 영역. 여러 번 쓸 수 있습니다. |
+| `--polygon "X,Y X,Y ..."` | 다각형 영역 (꼭짓점 3개 이상) |
+| `--selection 파일.json` | GUI에서 저장한 선택 영역 파일 |
+| `--subject` | Photoshop '피사체 선택'. 영역과 함께 쓰면 그 안의 피사체만 지웁니다. |
+| `--method content-aware\|transparent` | 내용 인식 채우기 (기본값) 또는 투명하게 잘라내기 |
+| `--expand PX`, `--feather PX` | 선택 영역 넓히기 (기본값 4), 가장자리 부드럽게 (기본값 0) |
+| `-o 파일`, `--output-dir 폴더`, `--suffix` | 저장 위치와 이름. 기본값은 원본 옆의 `이름_removed.확장자`이며, 이미 있으면 `_2`, `_3`…을 붙입니다. |
+| `--overwrite` | 같은 이름의 파일을 덮어씁니다. 원본에 덮어쓸 때도 필요합니다. |
+| `--no-keep-open` | 결과를 Photoshop에 열어 두지 않습니다. 사진이 여러 장이면 이것이 기본값입니다. |
+| `--export-jsx 파일.jsx` | Photoshop을 실행하지 않고 스크립트 파일만 만듭니다. |
+| `--photoshop "Adobe Photoshop 2025"` | macOS에서 Photoshop이 여러 버전 설치되어 있을 때 사용할 앱을 고릅니다. |
+| `--json` | 결과를 JSON으로 출력합니다. |
+
+저장 형식은 JPG, PNG, TIFF, PSD입니다. 원본 형식으로 저장할 수 없을 때(HEIC, GIF 등)는 JPG로, 투명하게 잘라낼 때는 PNG로 저장합니다.
+
+### 선택 영역 파일 형식
+
+GUI의 **[파일 > 선택 영역 저장]** 으로 만들 수 있고, 직접 써도 됩니다. `image_size`가 있으면 크기가 다른 사진에는 좌표를 비율에 맞춰 조정합니다 (가로세로 비율이 같을 때).
+
+```json
+{
+  "version": 1,
+  "image_size": [4000, 3000],
+  "shapes": [
+    {"type": "rect", "mode": "add", "box": [3500, 2800, 3980, 2980]},
+    {"type": "ellipse", "mode": "add", "box": [100, 100, 300, 250]},
+    {"type": "polygon", "mode": "add", "points": [[10, 10], [90, 15], [60, 80]]},
+    {"type": "brush", "mode": "subtract", "points": [[400, 400], [520, 460]], "radius": 15}
+  ]
+}
+```
+
+`box`는 `[왼쪽, 위, 오른쪽, 아래]`입니다. `mode`는 `add`(추가) 또는 `subtract`(빼기)입니다.
+
+## 동작 방식
+
+```
+GUI / 명령줄 (Python)
+   │  선택 영역과 옵션을 담은 Photoshop 스크립트(JSX)를 만든다
+   ▼
+Windows: COM (Photoshop.Application)      macOS: AppleScript "do javascript"
+   │  Photoshop이 꺼져 있으면 실행한다
+   ▼
+Photoshop (ps_remover/jsx/ps_remover.jsx)
+   사진 열기 → 선택 영역 만들기 → 넓히기/페더 → 내용 인식 채우기(또는 지우기)
+   → 새 파일로 저장 → 결과 열기 → 결과(JSON)를 돌려준다
+```
+
+- 사진이 이미 Photoshop에 열려 있으면 **복사본**에서 작업하므로, 열려 있던 문서와 저장하지 않은 변경 사항은 건드리지 않습니다.
+- 작업 중에는 눈금자 단위를 픽셀로 바꾸고 대화상자가 뜨지 않게 합니다. 끝나면 원래 설정으로 돌려놓습니다.
+- 해상도가 72ppi가 아닌 사진도 좌표가 어긋나지 않도록 72ppi에서 선택합니다. 픽셀은 그대로이고, 저장할 때는 원래 해상도로 돌려놓습니다.
+- 여러 레이어가 있는 파일은 보이는 레이어를 하나로 합친 뒤 작업합니다. 원본 파일은 바뀌지 않습니다.
+- 휴대폰 사진의 회전 정보(EXIF)는 Photoshop과 똑같이 적용해서 미리 보여 주므로, 그린 위치와 지워지는 위치가 같습니다.
+
+## 문제 해결
+
+| 증상 | 해결 방법 |
+| --- | --- |
+| macOS: "Photoshop 제어를 막았습니다" | **시스템 설정 > 개인정보 보호 및 보안 > 자동화**에서 이 도구를 실행한 앱(터미널 등)의 **Adobe Photoshop** 항목을 켜세요. |
+| Windows: "Photoshop을 찾을 수 없습니다" | Photoshop을 한 번 직접 실행한 뒤 다시 시도하세요. 그래도 안 되면 Photoshop을 다시 설치해 자동화(COM) 등록을 복구하세요. |
+| "Photoshop이 응답하지 않습니다" | Photoshop에 열린 대화상자(업데이트 알림, 로그인 등)가 있으면 닫고 다시 시도하세요. |
+| 미리보기가 안 됨 (RAW, HEIC 등) | HEIC는 `pip install pillow-heif`로 미리 볼 수 있습니다. RAW 파일은 **① Photoshop에서 열기**로 연 뒤 Photoshop에서 선택하세요. |
+| 지운 자리가 어색함 | **넓히기** 값을 키우거나 영역을 조금 더 넉넉하게 그리세요. 결과는 Photoshop에 열려 있으므로 제거 도구나 복구 브러시로 바로 다듬을 수 있습니다. |
+| 오류 뒤에 사진이 Photoshop에 남아 있음 | 일부러 열어 둔 것입니다. 선택 영역이 그대로 있으니 Photoshop에서 직접 마무리할 수 있습니다. |
+
+## 개발
+
+```bash
+pip install -e ".[test]"
+python -m pytest
+```
+
+- Photoshop 스크립트 테스트는 실제 Photoshop 대신, Node.js로 만든 가짜 Photoshop(`tests/jsx/mock_photoshop.js`)에서 실행합니다. Node.js가 없으면 이 테스트는 건너뜁니다.
+- Photoshop의 스크립트 엔진(ExtendScript)은 ECMAScript 3이라서, 가짜 Photoshop은 ES5 이후 기능(`forEach`, `JSON` 등)을 지운 상태로 스크립트를 실행합니다. `npm install --prefix tests/jsx`로 acorn을 설치하면 ES3 문법 검사도 함께 합니다.
+- GUI 테스트는 화면(디스플레이)이 있을 때만 실행됩니다. Linux에서는 `xvfb-run python -m pytest`로 실행할 수 있습니다.
+
+```
+ps_remover/
+  gui.py              Tkinter 화면
+  cli.py              명령줄
+  api.py              작업 단위 (지우기, 열기, 현재 선택 영역 지우기)
+  shapes.py           선택 도형과 좌표 처리
+  script.py           Photoshop 스크립트 생성
+  photoshop.py        Photoshop 실행 (Windows COM, macOS AppleScript)
+  jsx/ps_remover.jsx  Photoshop 안에서 실행되는 스크립트
+tests/                단위 테스트와 가짜 Photoshop
+```

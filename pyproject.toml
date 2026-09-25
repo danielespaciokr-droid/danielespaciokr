@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ps-remover"
+version = "0.1.0"
+description = "Photoshop을 실행해 사진 속 선택 영역을 지우는 도구 (내용 인식 채우기)"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "Pillow>=8.0",
+    "pywin32>=300; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+heic = ["pillow-heif>=0.10"]
+test = ["pytest>=7"]
+
+[project.scripts]
+ps-remover = "ps_remover.cli:main"
+
+[project.gui-scripts]
+ps-remover-gui = "ps_remover.gui:main"
+
+[tool.setuptools]
+packages = ["ps_remover"]
+
+[tool.setuptools.package-data]
+ps_remover = ["jsx/*.jsx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
