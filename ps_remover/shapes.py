@@ -12,7 +12,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 Point = Tuple[float, float]
 Box = Tuple[float, float, float, float]
@@ -20,7 +20,10 @@ Box = Tuple[float, float, float, float]
 KINDS = ("rect", "ellipse", "polygon", "brush")
 MODES = ("add", "subtract")
 FITS = ("exact", "anchor", "stretch")
+ORIENTATIONS = ("landscape", "portrait")
+ORIENTATION_LABELS = {"landscape": "가로 사진", "portrait": "세로 사진"}
 SELECTION_FILE_VERSION = 1
+AREA_SET_FILE_VERSION = 2
 
 # Anchor points for fit "anchor": (0, 0) is the top-left corner, (1, 1) the bottom-right.
 ANCHOR_LABELS = {
@@ -267,17 +270,78 @@ class Area:
         )
 
 
-def save_area(path, area: Area) -> None:
+def orientation_of(size: Tuple[float, float]) -> str:
+    """"portrait" for a photo taller than it is wide, otherwise "landscape"."""
+    return "portrait" if size[1] > size[0] else "landscape"
+
+
+@dataclass
+class AreaSet:
+    """A common area with its own :class:`Area` for landscape and/or portrait photos.
+
+    The same text often sits somewhere else on portrait photos than on landscape
+    ones, so each orientation can be drawn separately. A photo whose orientation
+    has no area of its own uses the other one, placed by that area's fit.
+    """
+
+    areas: Dict[str, Area]
+
+    def __post_init__(self) -> None:
+        if not self.areas or set(self.areas) - set(ORIENTATIONS):
+            raise SelectionError(f"공통 영역은 {', '.join(ORIENTATIONS)} 영역으로 이루어져야 합니다.")
+        self.areas = {o: self.areas[o] for o in ORIENTATIONS if o in self.areas}
+
+    @classmethod
+    def single(cls, area: Area) -> "AreaSet":
+        return cls({orientation_of(area.image_size) if area.image_size else "landscape": area})
+
+    def for_orientation(self, orientation: str) -> Area:
+        return self.areas.get(orientation) or next(iter(self.areas.values()))
+
+    def for_size(self, size: Tuple[int, int]) -> Area:
+        """The area to use on a photo of ``size``."""
+        return self.for_orientation(orientation_of(size))
+
+    def with_area(self, area: Area, orientation: Optional[str] = None) -> "AreaSet":
+        """A copy with ``area`` for its photo's orientation (or ``orientation``)."""
+        if orientation is None:
+            orientation = orientation_of(area.image_size) if area.image_size else "landscape"
+        return AreaSet(dict(self.areas, **{orientation: area}))
+
+    def describe(self) -> str:
+        return " / ".join(f"{ORIENTATION_LABELS[o]}: {a.describe()}" for o, a in self.areas.items())
+
+    def to_dict(self) -> dict:
+        data: dict = {"version": AREA_SET_FILE_VERSION}
+        for orientation, area in self.areas.items():
+            data[orientation] = {k: v for k, v in area.to_dict().items() if k != "version"}
+        return data
+
+    @classmethod
+    def from_dict(cls, data) -> "AreaSet":
+        if isinstance(data, dict) and any(o in data for o in ORIENTATIONS):
+            return cls({o: Area.from_dict(data[o]) for o in ORIENTATIONS if o in data})
+        return cls.single(Area.from_dict(data))  # a single-area file
+
+
+def area_has_shapes(area: Union[Area, AreaSet]) -> bool:
+    """True if the area (any of its orientations) adds something to the selection."""
+    areas = area.areas.values() if isinstance(area, AreaSet) else [area]
+    return any(has_area(a.shapes) for a in areas)
+
+
+def save_area(path, area: Union[Area, AreaSet]) -> None:
     Path(path).write_text(json.dumps(area.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def load_area(path) -> Area:
+def load_area_set(path) -> AreaSet:
+    """Read a selection or common-area file (one area, or one per orientation)."""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise SelectionError(f"선택 영역 파일을 읽을 수 없습니다: {path} ({exc})") from exc
     try:
-        return Area.from_dict(data)
+        return AreaSet.from_dict(data)
     except SelectionError as exc:
         raise SelectionError(f"{path}: {exc}") from None
 

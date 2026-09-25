@@ -223,7 +223,7 @@ class AppTests(unittest.TestCase):
         dialog.save()
         self.assertEqual(settings.list_presets(), ["워터마크"])
         self.assertEqual(app.preset.get(), "워터마크")
-        area = settings.load_preset("워터마크")
+        area = settings.load_preset("워터마크").areas["landscape"]
         self.assertEqual((area.image_size, area.fit, area.anchor), ((800, 600), "anchor", (1.0, 1.0)))
         box = app.shapes[0].box
 
@@ -241,6 +241,37 @@ class AppTests(unittest.TestCase):
         with mock.patch.object(gui.messagebox, "askyesno", return_value=True):
             app.delete_preset()
         self.assertEqual((settings.list_presets(), app.preset.get()), ([], ""))
+
+    def test_landscape_and_portrait_versions_of_a_common_area(self):
+        app = self.app
+        self.drag((650, 500), (790, 590))  # landscape photo: text at the bottom right
+        dialog = app.save_preset()
+        dialog.name.set("글씨")
+        dialog.save()
+        self.assertIn("세로 사진의 영역이 다르다면", app.status.get())
+        portrait = Path(self.tmp.name) / "portrait.jpg"
+        Image.new("RGB", (600, 800)).save(portrait)
+        app.load_photo(portrait)
+        self.drag((20, 700), (300, 780))  # portrait photo: text at the bottom left
+        dialog = app.save_preset()
+        self.assertEqual(dialog.name.get(), "글씨")  # adds to the common area in use
+        dialog.save()
+        area_set = settings.load_preset("글씨")
+        self.assertEqual(list(area_set.areas), ["landscape", "portrait"])
+        self.assertIn("모두 저장되어", app.status.get())
+        # Each orientation gets its own version back.
+        app.clear_shapes()
+        app.apply_preset()
+        self.assertEqual(app.shapes[0].box, area_set.areas["portrait"].shapes[0].box)
+        app.load_photo(self.photo)
+        app.apply_preset()
+        self.assertEqual(app.shapes[0].box, area_set.areas["landscape"].shapes[0].box)
+        # Saving the same orientation again asks before replacing it.
+        dialog = app.save_preset()
+        with mock.patch.object(gui.messagebox, "askyesno", return_value=False) as ask:
+            dialog.save()
+        self.assertIn("가로 사진용 영역을", ask.call_args.args[1])
+        dialog.window.destroy()
 
     def test_saving_needs_a_drawn_area(self):
         with mock.patch.object(gui.messagebox, "showinfo") as showinfo:
@@ -274,7 +305,9 @@ class AppTests(unittest.TestCase):
         self.app.open_batch_window()
         window = self.app._batch_window
         self.assertEqual(window.preset.get(), "워터마크")
-        self.assertIn("Photoshop [제거] 버튼", window.method.get())
+        self.assertEqual(window.method.get(), "action")  # starts from the main window's choice
+        self.assertTrue(window.watch.get())  # watching is the usual way to use it
+        window.watch.set(False)  # here: just the photos already in the folder
         window.input_dir.set(str(folder))
 
         def fake_remove(photo, area, output, options, **kwargs):
@@ -344,6 +377,12 @@ class AppTests(unittest.TestCase):
             window.start()
         self.assertIn("공통 영역", showinfo.call_args.args[1])
         self.assertFalse(window.running)
+        settings.save_preset("워터마크", shapes.Area([shapes.rect(0, 0, 10, 10)], (800, 600), "anchor"))
+        window.preset.set("워터마크")
+        with mock.patch.object(gui.messagebox, "showinfo") as showinfo:
+            self.assertFalse(window.start(quiet=True))  # quiet: the problem goes to the window
+        showinfo.assert_not_called()
+        self.assertIn("폴더를 고르세요", window.status.get())
 
     def wait_idle(self):
         for _ in range(100):
@@ -381,6 +420,128 @@ class AppTests(unittest.TestCase):
         with mock.patch.object(gui.filedialog, "askopenfilename", return_value=str(path)):
             self.app.load_selection()
         self.assertEqual(self.app.shapes[0].box, (20, 20, 220, 120))
+
+
+@unittest.skipUnless(_display_available(), "no display for Tk")
+class WatchWindowTests(unittest.TestCase):
+    """The auto-processing window on its own (auto_windows.bat, sign-in start)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        home = mock.patch.dict(os.environ, {"PS_REMOVER_HOME": str(self.home)})
+        home.start()
+        self.addCleanup(home.stop)
+        self.folder = Path(self.tmp.name) / "사진"
+        self.folder.mkdir()
+        for name, size in (("wide.jpg", (800, 600)), ("tall.jpg", (600, 800))):
+            path = self.folder / name
+            Image.new("RGB", size).save(path)
+            stamp = time.time() - 60
+            os.utime(path, (stamp, stamp))
+        landscape = shapes.Area([shapes.rect(700, 550, 90, 40)], (800, 600), "anchor")
+        portrait = shapes.Area([shapes.rect(500, 750, 90, 40)], (600, 800), "anchor")
+        settings.save_preset("글씨", shapes.AreaSet.single(landscape).with_area(portrait))
+        settings.save_settings("main", {"method": "content-aware", "action_set": "내 동작", "action_name": "지우기"})
+
+    def run_watch(self, start=False, until=None, seconds=5.0):
+        """Runs gui.watch_main until ``until(window)`` holds; returns what the window showed."""
+        created = []
+
+        class Recording(gui.BatchWindow):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        seen = {}
+
+        def mainloop(root, n=0):
+            window = created[0]
+            end = time.time() + seconds
+            while time.time() < end:
+                root.update()
+                time.sleep(0.02)
+                if until is None or until(window):
+                    break
+            seen.update(log=window.log.get("1.0", "end"), status=window.status.get(), running=window.running,
+                        title=root.title())
+            with mock.patch.object(gui.messagebox, "askyesno", return_value=True):
+                window.close()
+            seen["closed"] = True
+
+        def fake_remove(photo, area, output, options, **kwargs):
+            seen.setdefault("calls", []).append((photo.name, area, options))
+            output.write_bytes(b"result")
+            used = area.for_size(Image.open(photo).size)
+            which = "portrait" if used is area.areas.get("portrait") else "landscape"
+            return {"ok": True, "output": str(output), "warnings": [], "areaUsed": which}
+
+        with mock.patch.object(gui, "BatchWindow", Recording), mock.patch.object(tk.Tk, "mainloop", mainloop), \
+                mock.patch.object(gui.api, "remove_area", side_effect=fake_remove):
+            self.assertEqual(gui.watch_main(start=start), 0)
+        self.assertTrue(seen["closed"])
+        return seen
+
+    def test_starts_by_itself_with_the_saved_settings(self):
+        settings.save_settings("batch", {"preset": "글씨", "input_dir": str(self.folder), "method": "action",
+                                         "expand": "6", "watch": True, "interval": "1", "autostart": True})
+        seen = self.run_watch(until=lambda window: "기다리는 중" in window.log.get("1.0", "end"))
+        self.assertEqual(seen["title"], gui.BatchWindow.TITLE)
+        self.assertTrue(seen["running"])  # still watching for more photos
+        self.assertEqual(sorted(name for name, _, _ in seen["calls"]), ["tall.jpg", "wide.jpg"])
+        _, area, options = seen["calls"][0]
+        self.assertEqual(set(area.areas), {"landscape", "portrait"})
+        self.assertEqual((options.method, options.expand, options.action_set, options.action_name),
+                         ("action", 6, "내 동작", "지우기"))  # the action is the one set up in the main window
+        self.assertIn("완료  tall.jpg → tall_removed.jpg (세로 사진용 영역)", seen["log"])
+        self.assertIn("완료  wide.jpg → wide_removed.jpg (가로 사진용 영역)", seen["log"])
+        self.assertEqual(sorted(p.name for p in (self.folder / "지운 사진").iterdir()),
+                         ["tall_removed.jpg", "wide_removed.jpg"])
+
+    def test_waits_for_start_when_autostart_is_off(self):
+        settings.save_settings("batch", {"preset": "글씨", "input_dir": str(self.folder), "autostart": False})
+        seen = self.run_watch(until=lambda window: False, seconds=1.0)
+        self.assertFalse(seen["running"])
+        self.assertNotIn("calls", seen)
+        # Started at sign-in, it starts anyway.
+        seen = self.run_watch(start=True, until=lambda window: "기다리는 중" in window.log.get("1.0", "end")
+                              or "끝났습니다" in window.log.get("1.0", "end"))
+        self.assertEqual(len(seen["calls"]), 2)
+
+    def test_problems_are_shown_in_the_window(self):
+        settings.save_settings("batch", {"preset": "글씨", "input_dir": str(self.folder / "없는 폴더")})
+        with mock.patch.object(gui.messagebox, "showinfo") as showinfo:
+            seen = self.run_watch(until=lambda window: "찾을 수 없습니다" in window.status.get())
+        showinfo.assert_not_called()  # nobody may be at the computer after sign-in
+        self.assertFalse(seen["running"])
+        self.assertIn("사진 폴더를 찾을 수 없습니다", seen["status"])
+
+    def test_start_at_sign_in_option(self):
+        appdata = Path(self.tmp.name) / "AppData"
+        settings.save_settings("batch", {"autostart": False})
+        with mock.patch.object(gui.settings.sys, "platform", "win32"), \
+                mock.patch.dict(os.environ, {"APPDATA": str(appdata)}):
+            root = tk.Tk()
+            self.addCleanup(self._destroy, root)
+            window = gui.BatchWindow(root, standalone=True)
+            self.assertFalse(window.login_start.get())
+            window.login_start.set(True)
+            window._toggle_login_start()
+            self.assertTrue(settings.starts_at_login())
+            self.assertTrue(window.autostart.get())  # sign-in start has to start watching by itself
+            self.assertTrue(settings.load_settings("batch")["autostart"])
+            window.login_start.set(False)
+            window._toggle_login_start()
+            self.assertFalse(settings.starts_at_login())
+            window.close()
+
+    @staticmethod
+    def _destroy(root):
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass  # closed by the test already
 
 
 if __name__ == "__main__":

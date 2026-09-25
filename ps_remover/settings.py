@@ -7,11 +7,12 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Union
 
-from .shapes import Area, SelectionError, load_area, save_area
+from .shapes import Area, AreaSet, SelectionError, load_area_set, save_area
 
 APP_NAME = "ps-remover"
+STARTUP_SCRIPT_NAME = "PS Remover 폴더 자동 처리.cmd"
 _BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
@@ -51,19 +52,19 @@ def list_presets() -> List[str]:
     return sorted((path.stem for path in folder.glob("*.json")), key=str.casefold)
 
 
-def save_preset(name: str, area: Area) -> Path:
+def save_preset(name: str, area: Union[Area, AreaSet]) -> Path:
     path = preset_path(name)
     path.parent.mkdir(parents=True, exist_ok=True)
     save_area(path, area)
     return path
 
 
-def load_preset(name: str) -> Area:
+def load_preset(name: str) -> AreaSet:
     path = preset_path(name)
     if not path.is_file():
         saved = ", ".join(list_presets()) or "없음"
         raise SelectionError(f"공통 영역 '{name.strip()}'이(가) 없습니다. 저장된 공통 영역: {saved}")
-    return load_area(path)
+    return load_area_set(path)
 
 
 def delete_preset(name: str) -> None:
@@ -92,3 +93,48 @@ def _read_settings() -> dict:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+# ------------------------------------------------------- start at sign-in
+
+
+def startup_script_path() -> Optional[Path]:
+    """The script Windows runs at sign-in to start the folder watcher; None elsewhere."""
+    appdata = os.environ.get("APPDATA")
+    if sys.platform != "win32" or not appdata:
+        return None
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / STARTUP_SCRIPT_NAME
+
+
+def starts_at_login() -> bool:
+    path = startup_script_path()
+    return bool(path and path.is_file())
+
+
+def set_start_at_login(enabled: bool) -> None:
+    """Add or remove the folder watcher from the programs Windows starts at sign-in."""
+    path = startup_script_path()
+    if path is None:
+        raise OSError("Windows에서만 쓸 수 있는 기능입니다.")
+    if not enabled:
+        if path.is_file():
+            path.unlink()
+        return
+    project = Path(__file__).resolve().parent.parent
+    lines = [
+        "@echo off",
+        "rem Starts the PS Remover folder watcher when you sign in to Windows.",
+        "rem Remove this file (or untick the option in the program) to stop that.",
+        "chcp 65001 >nul",
+        f'cd /d "{project}"',
+        f'start "" "{_windowless_python()}" -m ps_remover watch --start',
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _windowless_python() -> str:
+    """pythonw.exe next to this Python, so no console window stays open."""
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    return str(pythonw if pythonw.is_file() else sys.executable)

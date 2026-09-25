@@ -35,6 +35,9 @@ class BatchTestCase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name) / "사진"
         self.dir.mkdir()
+        poll = mock.patch.object(batch, "SETTLE_POLL_SECONDS", 0.01)  # the second look comes quickly
+        poll.start()
+        self.addCleanup(poll.stop)
 
     def photo(self, name, age=10.0):
         path = self.dir / name
@@ -70,26 +73,32 @@ class BatchJobTests(BatchTestCase):
             self.job(output_dir=self.dir, suffix="")  # results would look like new photos
         batch.BatchJob(self.dir, shapes.Area([]), options=api.RemoveOptions(subject=True))
 
-    def test_scan_finds_new_photos_only(self):
+    def test_candidates_are_new_photos_only(self):
         for name in ("b.PNG", "a.jpg", "raw.CR2"):
             self.photo(name)
         for name in ("notes.txt", ".a.jpg", "c_removed.jpg", "c_removed_2.jpg"):
             self.photo(name)
         (self.dir / "folder.jpg").mkdir()
         job = self.job(output_dir=self.dir)
-        self.assertEqual([p.name for p in job.scan()[0]], ["a.jpg", "b.PNG", "raw.CR2"])
+        found = job.candidates()
+        self.assertEqual([p.name for p, _ in found], ["a.jpg", "b.PNG", "raw.CR2"])
+        self.assertEqual(found[0][1][0], len(b"photo"))  # (size, mtime) snapshot
 
-    def test_scan_skips_done_and_waits_for_copies(self):
+    def test_candidates_skip_done_photos(self):
         self.photo("a.jpg")
         self.photo("b.jpg")
-        self.photo("copying.jpg", age=0)
         job = self.job()
         job.output_dir.mkdir()
-        (job.output_dir / "a_removed.jpg").write_bytes(b"done")
-        self.assertEqual(([p.name for p in job.scan()[0]], job.scan()[1]), (["b.jpg"], 1))
+        (job.output_dir / "A_REMOVED.JPG").write_bytes(b"done")  # file systems here ignore case
+        self.assertEqual([p.name for p, _ in job.candidates()], ["b.jpg"])
+        self.assertEqual([p.name for p, _ in job.candidates(skip={self.dir / "b.jpg"})], [])
         job.skip_done = False
-        self.assertEqual([p.name for p in job.scan()[0]], ["a.jpg", "b.jpg"])
-        self.assertEqual([p.name for p in job.scan(skip={self.dir / "a.jpg"})[0]], ["b.jpg"])
+        self.assertEqual([p.name for p, _ in job.candidates()], ["a.jpg", "b.jpg"])
+
+    def test_file_in_use_is_a_windows_check(self):
+        path = self.photo("a.jpg")
+        with mock.patch.object(batch.sys, "platform", "linux"):
+            self.assertFalse(batch.file_in_use(path))
 
 
 class BatchRunnerTests(BatchTestCase):
@@ -158,9 +167,44 @@ class BatchRunnerTests(BatchTestCase):
     def test_waits_for_a_photo_that_is_still_copying(self):
         self.photo("a.jpg", age=0)
         remove = FakeRemove()
+        start = time.monotonic()
         with mock.patch.object(batch, "SETTLE_SECONDS", 0.2), mock.patch.object(batch, "SETTLE_POLL_SECONDS", 0.05):
             _, events = self.run_job(self.job(), remove)
         self.assertEqual([c["photo"] for c in remove.calls], ["a.jpg"])
+        self.assertGreaterEqual(time.monotonic() - start, 0.15)
+
+    def test_ready_only_when_unchanged_between_looks(self):
+        runner = batch.BatchRunner(self.job(), lambda event: None, remove=FakeRemove())
+        path = self.dir / "a.jpg"
+        now = 1000.0
+        looks = [(100, 900.0), (250, 900.5), (250, 900.5)]  # still growing, then steady
+        results = [runner._check([(path, snapshot)], now, watch=True) for snapshot in looks]
+        self.assertEqual(results, [([], 1), ([], 1), ([path], 0)])
+        # An empty file is never ready.
+        empty = self.dir / "b.jpg"
+        results = [runner._check([(empty, (0, 900.0))], now, watch=True) for _ in range(2)]
+        self.assertEqual(results[-1], ([], 1))
+
+    def test_waits_while_another_program_writes(self):
+        self.photo("a.jpg")
+        remove = FakeRemove()
+        with mock.patch.object(batch, "file_in_use", side_effect=[True, True, False]) as in_use:
+            _, events = self.run_job(self.job(), remove)
+        self.assertEqual(in_use.call_count, 3)  # asked again at each look until it was free
+        self.assertEqual([c["photo"] for c in remove.calls], ["a.jpg"])
+
+    def test_single_run_gives_up_on_a_busy_photo(self):
+        self.photo("a.jpg")
+        self.photo("b.jpg")
+        remove = FakeRemove()
+        busy = lambda path: path.name == "a.jpg"  # noqa: E731
+        with mock.patch.object(batch, "file_in_use", side_effect=busy), \
+                mock.patch.object(batch, "BUSY_GIVE_UP_SECONDS", 0.05):
+            runner, events = self.run_job(self.job(), remove)
+        self.assertEqual([c["photo"] for c in remove.calls], ["b.jpg"])
+        failed = [e for e in events if e["type"] == "failed"]
+        self.assertEqual(failed[0]["photo"].name, "a.jpg")
+        self.assertIn("다른 프로그램", failed[0]["error"])
 
     def test_watch_mode_picks_up_new_photos(self):
         self.photo("a.jpg")

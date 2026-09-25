@@ -10,10 +10,11 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from . import __version__, api
-from .batch import DEFAULT_OUTPUT_FOLDER, BatchJob, BatchRunner
+from .batch import DEFAULT_OUTPUT_FOLDER, DEFAULT_WATCH_INTERVAL, BatchJob, BatchRunner
 from .photoshop import PhotoshopError, ScriptFailed
 from .settings import check_preset_name, delete_preset, list_presets, load_preset, presets_dir
-from .shapes import Area, SelectionError, ellipse, has_area, load_area, parse_box, parse_points, polygon, rect
+from .shapes import (ORIENTATION_LABELS, Area, SelectionError, area_has_shapes, ellipse, load_area_set,
+                     parse_box, parse_points, polygon, rect)
 
 DESCRIPTION = "Photoshop을 실행해 사진을 열고, 지정한 영역을 선택해 지우는 도구입니다."
 
@@ -25,6 +26,7 @@ EPILOG = """\
   ps-remover remove 인물.jpg --subject                  Photoshop '피사체 선택'으로 찾은 대상을 지우기
   ps-remover batch 사진폴더 --preset 워터마크           폴더의 새 사진마다 공통 영역 지우기
   ps-remover batch 사진폴더 --preset 워터마크 --watch   새 사진이 들어올 때마다 계속 지우기
+  ps-remover watch                                      폴더 자동 처리 창만 열기 (저장된 설정으로 바로 시작)
   ps-remover presets                                    저장된 공통 영역 보기
   ps-remover remove 사진.jpg --rect 120,80,300,200 --method action
                                                         녹화해 둔 동작으로 Photoshop [제거] 버튼 쓰기
@@ -46,6 +48,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     gui = commands.add_parser("gui", help="GUI 실행 (기본값)")
     gui.add_argument("photo", nargs="?", help="처음에 열 사진")
+
+    watch = commands.add_parser(
+        "watch",
+        help="폴더 자동 처리 창만 열기 (새 사진이 들어오면 바로 지움)",
+        description="폴더 자동 처리 창을 엽니다. 창에 저장된 사진 폴더와 공통 영역으로 감시를 시작해, "
+                    "사진이 들어오는 대로 공통 영역을 지웁니다.",
+    )
+    watch.add_argument("--start", action="store_true",
+                       help="'창을 열면 바로 시작'이 꺼져 있어도 바로 시작 (Windows 시작 시 자동 실행용)")
 
     remove = commands.add_parser(
         "remove",
@@ -86,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--reprocess", action="store_true", help="이미 지운 사진도 다시 처리해서 덮어쓰기")
     group.add_argument("--watch", action="store_true",
                        help="끝난 뒤에도 폴더를 지켜보다가 새 사진이 들어오면 지우기 (Ctrl+C로 끝내기)")
-    group.add_argument("--interval", type=float, default=10.0, metavar="초",
+    group.add_argument("--interval", type=float, default=DEFAULT_WATCH_INTERVAL, metavar="초",
                        help="--watch일 때 폴더를 확인하는 간격 (기본값: %(default)s초)")
     _add_common_options(batch)
 
@@ -186,6 +197,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from .gui import main as gui_main
 
         return gui_main(getattr(args, "photo", None))
+    if args.command == "watch":
+        from .gui import watch_main
+
+        return watch_main(start=args.start)
     commands = {
         "remove": _cmd_remove,
         "batch": _cmd_batch,
@@ -323,8 +338,13 @@ def _cmd_presets(args) -> int:
         if area is None:
             print(f"- {name}: 읽을 수 없음 ({error})")
             continue
-        size = f"{area.image_size[0]}x{area.image_size[1]} 사진 기준, " if area.image_size else ""
-        print(f"- {name}: 도형 {len(area.shapes)}개, {size}{area.describe()}")
+        print(f"- {name}")
+        for orientation, part in area.areas.items():
+            size = f", {part.image_size[0]}x{part.image_size[1]} 사진 기준" if part.image_size else ""
+            print(f"    {ORIENTATION_LABELS[orientation]}용: 도형 {len(part.shapes)}개{size}, {part.describe()}")
+        if len(area.areas) == 1:
+            other = "세로" if "landscape" in area.areas else "가로"
+            print(f"    ({other} 사진에도 위 영역을 맞춰서 씁니다)")
     print(f"저장 위치: {presets_dir()}")
     return 0
 
@@ -332,7 +352,7 @@ def _cmd_presets(args) -> int:
 def _cmd_open(args) -> int:
     area = _collect_area(args, required=False)
     options = api.RemoveOptions(expand=args.expand, feather=args.feather)
-    result = api.open_photo(args.photo, area if has_area(area.shapes) else None, options,
+    result = api.open_photo(args.photo, area if area_has_shapes(area) else None, options,
                             photoshop=args.photoshop, timeout=args.timeout)
     text = f"Photoshop에서 열었습니다: {args.photo}"
     if result.get("selectionBounds"):
@@ -387,7 +407,7 @@ def _expand_photos(patterns: Sequence[str]) -> List[Path]:
     return photos
 
 
-def _collect_area(args, required: bool = True) -> Area:
+def _collect_area(args, required: bool = True):
     drawn = ([rect(*parse_box(text)) for text in args.rect]
              + [ellipse(*parse_box(text)) for text in args.ellipse]
              + [polygon(parse_points(text)) for text in args.polygon])
@@ -398,10 +418,10 @@ def _collect_area(args, required: bool = True) -> Area:
     if args.preset:
         area = load_preset(args.preset)
     elif args.selection:
-        area = load_area(args.selection)
+        area = load_area_set(args.selection)
     else:
         area = Area(drawn)
-    if required and not has_area(area.shapes) and not getattr(args, "subject", False):
+    if required and not area_has_shapes(area) and not getattr(args, "subject", False):
         raise api.JobError("지울 영역을 --preset, --selection, --rect, --ellipse, --polygon 또는 --subject로 지정하세요.")
     return area
 

@@ -30,6 +30,8 @@ var PSR_DEFAULTS = {
     expectedSize: null,         // [width, height] the shapes were drawn against
     fit: "exact",               // how to place them on other sizes, see psrShapeTransform()
     anchor: null,               // fit "anchor": [0..1, 0..1], e.g. [1, 1] = bottom-right corner
+    areas: null,                // instead of the four keys above: [{when: "landscape" | "portrait",
+                                //   ops, expectedSize, fit, anchor}, ...], chosen by the photo's shape
     method: "content-aware",    // "content-aware" | "action" | "transparent"
     actionSet: "ps-remover",    // method "action": the recorded Photoshop action to play,
     actionName: "제거",          // e.g. a click on the Contextual Task Bar's Remove button
@@ -99,10 +101,11 @@ function psrActionRemove(cfg, result, job) {
     app.activeDocument = doc;
     result.document = psrDocumentInfo(doc);
 
-    var transform = psrShapeTransform(doc, cfg, result);
+    var area = psrPickArea(doc, cfg, result);
+    var transform = psrShapeTransform(doc, area, result);
     psrPrepareDocument(doc, cfg, result);
     psrAtPixelResolution(doc, function () {
-        psrBuildSelection(doc, psrTransformOps(cfg.ops, transform), cfg.subject, result);
+        psrBuildSelection(doc, psrTransformOps(area.ops, transform), cfg.subject, result);
         psrRefineSelection(doc, cfg);
         result.selectionBounds = psrSelectionBounds(doc);
         psrRemoveSelected(doc, cfg, result);
@@ -132,11 +135,12 @@ function psrActionOpen(cfg, result) {
     var doc = app.open(psrInputFile(cfg));
     app.activeDocument = doc;
     result.document = psrDocumentInfo(doc);
-    if (cfg.ops.length > 0) {
-        var transform = psrShapeTransform(doc, cfg, result);
+    var area = psrPickArea(doc, cfg, result);
+    if (area.ops && area.ops.length > 0) {
+        var transform = psrShapeTransform(doc, area, result);
         psrInHistory(doc, PSR_SELECT_HISTORY_NAME, function () {
             psrAtPixelResolution(doc, function () {
-                psrBuildSelection(doc, psrTransformOps(cfg.ops, transform), false, result);
+                psrBuildSelection(doc, psrTransformOps(area.ops, transform), false, result);
                 psrRefineSelection(doc, cfg);
                 result.selectionBounds = psrSelectionBounds(doc);
             });
@@ -288,6 +292,20 @@ function psrInHistory(doc, name, fn) {
 }
 
 // ---------------------------------------------------------------- selection
+
+// What to select: the config's own shapes, or for a common area drawn separately
+// for landscape and portrait photos, the version matching this document.
+function psrPickArea(doc, cfg, result) {
+    var areas = cfg.areas;
+    if (!areas || areas.length === 0) return cfg;
+    var orientation = psrPx(doc.height) > psrPx(doc.width) ? "portrait" : "landscape";
+    var area = areas[0];
+    for (var i = 0; i < areas.length; i++) {
+        if (areas[i].when == orientation) area = areas[i];
+    }
+    result.areaUsed = area.when;
+    return area;
+}
 
 // Place shapes drawn on a photo of cfg.expectedSize onto this document.
 // Returns [sx, sy, tx, ty] for x -> sx * x + tx, y -> sy * y + ty.

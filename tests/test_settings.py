@@ -40,7 +40,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(path.name, "워터마크.json")
         settings.save_preset("logo", AREA)
         self.assertEqual(settings.list_presets(), ["logo", "워터마크"])
-        self.assertEqual(settings.load_preset("워터마크"), AREA)
+        self.assertEqual(settings.load_preset("워터마크"), shapes.AreaSet.single(AREA))
         settings.delete_preset("워터마크")
         self.assertEqual(settings.list_presets(), ["logo"])
         with self.assertRaisesRegex(SelectionError, "logo"):  # names the presets that do exist
@@ -60,6 +60,33 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.load_settings("batch"), {})
         settings.save_settings("batch", {"a": 1})  # recovers from a broken file
         self.assertEqual(settings.load_settings("batch"), {"a": 1})
+
+    def test_start_at_login_is_windows_only(self):
+        with mock.patch.object(settings.sys, "platform", "linux"):
+            self.assertIsNone(settings.startup_script_path())
+            self.assertFalse(settings.starts_at_login())
+            with self.assertRaises(OSError):
+                settings.set_start_at_login(True)
+
+    def test_start_at_login(self):
+        appdata = Path(self.tmp.name) / "AppData"
+        with mock.patch.object(settings.sys, "platform", "win32"), \
+                mock.patch.dict(os.environ, {"APPDATA": str(appdata)}):
+            path = settings.startup_script_path()
+            self.assertEqual(path.parent, appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup")
+            self.assertFalse(settings.starts_at_login())
+            settings.set_start_at_login(True)
+            self.assertTrue(settings.starts_at_login())
+            raw = path.read_bytes()
+            self.assertIn(b"\r\n", raw)  # a batch file needs Windows line endings
+            text = raw.decode("utf-8")
+            self.assertIn("chcp 65001", text)  # the project folder may have a Korean name
+            self.assertIn(f'cd /d "{Path(settings.__file__).resolve().parent.parent}"', text)
+            self.assertIn("-m ps_remover watch --start", text)
+            settings.set_start_at_login(True)  # again: still one file
+            settings.set_start_at_login(False)
+            self.assertFalse(path.exists())
+            settings.set_start_at_login(False)  # nothing to remove
 
 
 if __name__ == "__main__":

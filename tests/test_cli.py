@@ -99,7 +99,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(remove.call_count, 2)
         first_call = remove.call_args_list[0]
-        self.assertEqual(first_call.args[1].image_size, (640, 480))
+        self.assertEqual(first_call.args[1].areas["landscape"].image_size, (640, 480))
         self.assertFalse(first_call.args[3].keep_open)  # several photos: do not leave them all open
         self.assertEqual(remove.call_args_list[1].args[2], self.dir / "out" / "second_removed.png")
         lines = [json.loads(line) for line in out.splitlines()]
@@ -185,7 +185,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("저장된 공통 영역이 없습니다", out)
         settings.save_preset("워터마크", shapes.Area([shapes.rect(3500, 2800, 3980, 2980)], (4000, 3000), "anchor"))
         code, out, _ = run(["presets"])
-        self.assertIn("- 워터마크: 도형 1개, 4000x3000 사진 기준, 오른쪽 아래 기준으로 맞춤", out)
+        self.assertIn("- 워터마크\n    가로 사진용: 도형 1개, 4000x3000 사진 기준, 오른쪽 아래 기준으로 맞춤", out)
+        self.assertIn("세로 사진에도 위 영역을 맞춰서 씁니다", out)
+        portrait = shapes.Area([shapes.rect(0, 3800, 900, 3990)], (3000, 4000), "anchor")
+        settings.save_preset("워터마크", settings.load_preset("워터마크").with_area(portrait))
+        code, out, _ = run(["presets"])
+        self.assertIn("    세로 사진용: 도형 1개, 3000x4000 사진 기준, 왼쪽 아래 기준으로 맞춤", out)
         code, out, _ = run(["presets", "--json"])
         self.assertEqual(json.loads(out)[0]["name"], "워터마크")
         code, _, err = run(["presets", "--delete", "없는이름"])
@@ -200,12 +205,12 @@ class CliTests(unittest.TestCase):
         with mock.patch("ps_remover.api.remove_area", return_value={"ok": True, "output": "o"}) as remove:
             code, _, err = run(["remove", str(self.photo), "--preset", "워터마크"])
         self.assertEqual(code, 0, err)
-        self.assertEqual(remove.call_args.args[1], area)
+        self.assertEqual(remove.call_args.args[1], shapes.AreaSet.single(area))
         with mock.patch("ps_remover.api.open_photo", return_value={"ok": True, "selectionBounds": [1, 2, 3, 4]}) as open_:
             code, out, _ = run(["open", str(self.photo), "--preset", "워터마크", "--expand", "0"])
         self.assertEqual(code, 0)
         photo, opened_area, options = open_.call_args.args
-        self.assertEqual((opened_area, options.expand), (area, 0))
+        self.assertEqual((opened_area, options.expand), (shapes.AreaSet.single(area), 0))
         self.assertIn("선택해 두었습니다", out)
         with mock.patch("ps_remover.api.open_photo", return_value={"ok": True}) as open_:
             run(["open", str(self.photo)])
@@ -261,6 +266,13 @@ class CliTests(unittest.TestCase):
         with mock.patch("ps_remover.gui.main", return_value=0) as gui_main:
             self.assertEqual(cli.main([]), 0)
         gui_main.assert_called_once_with(None)
+
+    @unittest.skipUnless(importlib.util.find_spec("tkinter"), "tkinter is not installed")
+    def test_watch_opens_the_auto_processing_window(self):
+        with mock.patch("ps_remover.gui.watch_main", return_value=0) as watch_main:
+            self.assertEqual(cli.main(["watch"]), 0)
+            self.assertEqual(cli.main(["watch", "--start"]), 0)
+        self.assertEqual(watch_main.call_args_list, [mock.call(start=False), mock.call(start=True)])
 
 
 if __name__ == "__main__":

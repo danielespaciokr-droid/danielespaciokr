@@ -201,6 +201,38 @@ class JsxEngineTests(unittest.TestCase):
                 self.assertEqual(self.selected_box(out), expected)
                 self.assertEqual(out["report"]["warnings"], [])  # expected for these fits, not worth a warning
 
+    def test_landscape_and_portrait_areas(self):
+        landscape = shapes.Area([shapes.rect(3500, 2800, 3980, 2980)], (4000, 3000), "anchor")
+        portrait = shapes.Area([shapes.rect(100, 3800, 900, 3950)], (3000, 4000), "anchor")
+        both = shapes.AreaSet({"landscape": landscape, "portrait": portrait})
+        config = api.build_remove_config("photo.jpg", "out.jpg", both, api.RemoveOptions(expand=0))
+        config.update(input=PHOTO, output=OUTPUT)
+        self.assertEqual([a["when"] for a in config["areas"]], ["landscape", "portrait"])
+        for size, used, box in (((4000, 3000), "landscape", (3500, 2800, 3980, 2980)),
+                                ((3000, 4000), "portrait", (100, 3800, 900, 3950)),
+                                ((1500, 2000), "portrait", (50, 1900, 450, 1975))):  # smaller portrait photo
+            with self.subTest(size=size):
+                out = self.run_script(config, images={PHOTO: {"width": size[0], "height": size[1]}})
+                report = out["report"]
+                self.assertTrue(report["ok"], report.get("error"))
+                self.assertEqual(report["areaUsed"], used)
+                self.assertEqual(self.selected_box(out), box)
+        # A common area drawn only on landscape photos is placed on portrait ones by its anchor.
+        config = api.build_remove_config("photo.jpg", "out.jpg", shapes.AreaSet.single(landscape),
+                                         api.RemoveOptions(expand=0))
+        config.update(input=PHOTO, output=OUTPUT)
+        self.assertNotIn("areas", config)
+        out = self.run_script(config, images={PHOTO: {"width": 3000, "height": 4000}})
+        self.assertEqual(self.selected_box(out), (2500, 3800, 2980, 3980))
+
+    def test_open_picks_the_orientation_too(self):
+        both = shapes.AreaSet({"landscape": shapes.Area([shapes.rect(10, 10, 20, 20)], (400, 300)),
+                               "portrait": shapes.Area([shapes.rect(30, 30, 40, 40)], (300, 400))})
+        config = api.build_open_config("photo.jpg", both, api.RemoveOptions(expand=0))
+        config["input"] = PHOTO
+        out = self.run_script(config, images={PHOTO: {"width": 300, "height": 400}})
+        self.assertEqual(out["report"]["selectionBounds"], [30, 30, 40, 40])
+
     def test_rotated_photo_is_reported(self):
         out = self.run_script(remove_config(image_size=(3000, 4000)))
         self.assertFalse(out["report"]["ok"])

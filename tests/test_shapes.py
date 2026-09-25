@@ -130,26 +130,26 @@ class AreaTests(unittest.TestCase):
             path = Path(tmp) / "선택.json"
             area = shapes.Area([shapes.rect(1, 2, 3, 4), shapes.brush([(5, 5)], 2)], (640, 480), "anchor", (1, 0.5))
             shapes.save_area(path, area)
-            loaded = shapes.load_area(path)
-        self.assertEqual(loaded, area)
-        self.assertEqual([s.kind for s in loaded.shapes], ["rect", "brush"])
+            loaded = shapes.load_area_set(path)
+        self.assertEqual(loaded, shapes.AreaSet({"landscape": area}))
+        self.assertEqual([s.kind for s in loaded.areas["landscape"].shapes], ["rect", "brush"])
 
     def test_old_files_and_bare_lists_load(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "s.json"
             path.write_text('{"version": 1, "image_size": [640, 480], "shapes": [{"type": "rect", "box": [0, 0, 10, 10]}]}',
                             encoding="utf-8")
-            area = shapes.load_area(path)
+            area = shapes.load_area_set(path).areas["landscape"]
             self.assertEqual((area.image_size, area.fit, area.anchor), ((640, 480), "exact", None))
             path.write_text('[{"type": "rect", "box": [0, 0, 10, 10]}]', encoding="utf-8")
-            area = shapes.load_area(path)
+            area = shapes.load_area_set(path).areas["landscape"]
             self.assertEqual((len(area.shapes), area.image_size), (1, None))
             for text in ("{not json", '{"shapes": 3}', '{"shapes": [], "fit": "zoom"}', '{"shapes": [], "anchor": [1]}'):
                 path.write_text(text, encoding="utf-8")
                 with self.subTest(text=text), self.assertRaises(SelectionError):
-                    shapes.load_area(path)
+                    shapes.load_area_set(path)
             with self.assertRaises(SelectionError):
-                shapes.load_area(Path(tmp) / "missing.json")
+                shapes.load_area_set(Path(tmp) / "missing.json")
 
     def test_validation(self):
         with self.assertRaises(SelectionError):
@@ -194,6 +194,49 @@ class AreaTests(unittest.TestCase):
     def test_transformed_brush_radius(self):
         moved = shapes.brush([(10, 10)], 4).transformed(2, 2, 5, 0)
         self.assertEqual((moved.points, moved.radius), ([(25.0, 20.0)], 8.0))
+
+    def test_area_set_picks_by_orientation(self):
+        landscape = shapes.Area(self.WATERMARK, (4000, 3000), "anchor")
+        portrait = shapes.Area([shapes.rect(100, 3800, 900, 3950)], (3000, 4000), "anchor")
+        self.assertEqual(shapes.orientation_of((3000, 4000)), "portrait")
+        self.assertEqual(shapes.orientation_of((4000, 4000)), "landscape")  # square counts as landscape
+        one = shapes.AreaSet.single(landscape)
+        self.assertIs(one.for_size((1500, 2000)), landscape)  # no portrait version: the other one is used
+        both = one.with_area(portrait)
+        self.assertEqual(list(both.areas), ["landscape", "portrait"])
+        self.assertIs(both.for_size((1500, 2000)), portrait)
+        self.assertIs(both.for_size((2000, 1500)), landscape)
+        self.assertIs(one.areas["landscape"], landscape)  # with_area returns a copy
+        replaced = both.with_area(landscape, "portrait")
+        self.assertIs(replaced.areas["portrait"], landscape)
+        self.assertIn("세로 사진", both.describe())
+        with self.assertRaises(SelectionError):
+            shapes.AreaSet({})
+        with self.assertRaises(SelectionError):
+            shapes.AreaSet({"square": landscape})
+
+    def test_area_set_files(self):
+        landscape = shapes.Area(self.WATERMARK, (4000, 3000), "anchor")
+        portrait = shapes.Area([shapes.rect(100, 3800, 900, 3950)], (3000, 4000), "stretch")
+        both = shapes.AreaSet({"portrait": portrait, "landscape": landscape})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "both.json"
+            shapes.save_area(path, both)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual((data["version"], list(data)[1:]), (2, ["landscape", "portrait"]))
+            self.assertNotIn("version", data["portrait"])
+            self.assertEqual(shapes.load_area_set(path), both)
+            # A single area drawn on a portrait photo becomes the portrait version.
+            shapes.save_area(path, portrait)
+            self.assertEqual(list(shapes.load_area_set(path).areas), ["portrait"])
+
+    def test_area_has_shapes(self):
+        self.assertFalse(shapes.area_has_shapes(shapes.Area([])))
+        self.assertTrue(shapes.area_has_shapes(shapes.Area(self.WATERMARK)))
+        subtract_only = shapes.Area([shapes.rect(0, 0, 5, 5, mode="subtract")], (10, 20))
+        self.assertTrue(shapes.area_has_shapes(shapes.AreaSet({"landscape": shapes.Area([], (20, 10)),
+                                                              "portrait": shapes.Area(self.WATERMARK, (10, 20))})))
+        self.assertFalse(shapes.area_has_shapes(shapes.AreaSet.single(subtract_only)))
 
     def test_describe(self):
         self.assertIn("오른쪽 아래", shapes.Area(self.WATERMARK, (4000, 3000), "anchor").describe())

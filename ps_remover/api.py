@@ -5,11 +5,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from .photoshop import run_jsx
 from .script import build_script
-from .shapes import Area, has_area, selection_ops
+from .shapes import Area, AreaSet, area_has_shapes, selection_ops
 
 METHODS = ("content-aware", "action", "transparent")
 DEFAULT_ACTION_SET = "ps-remover"
@@ -86,12 +86,12 @@ def default_output_path(photo, method: str = "content-aware", suffix: str = DEFA
     return candidate
 
 
-def build_remove_config(photo, output, area: Area, options: Optional[RemoveOptions] = None,
+def build_remove_config(photo, output, area: Union[Area, AreaSet], options: Optional[RemoveOptions] = None,
                         report: str = "return") -> dict:
     """The job description the Photoshop script expects for the "remove" action."""
     options = options or RemoveOptions()
     options.validate()
-    if not has_area(area.shapes) and not options.subject:
+    if not area_has_shapes(area) and not options.subject:
         raise JobError("지울 영역이 없습니다. 영역을 선택하거나 '피사체 선택'을 켜세요.")
     output = Path(output)
     if output.suffix.lower() not in SAVE_EXTENSIONS:
@@ -113,14 +113,15 @@ def build_remove_config(photo, output, area: Area, options: Optional[RemoveOptio
     }
 
 
-def remove_area(photo, area: Area, output=None, options: Optional[RemoveOptions] = None,
+def remove_area(photo, area: Union[Area, AreaSet], output=None, options: Optional[RemoveOptions] = None,
                 overwrite: bool = False, photoshop: Optional[str] = None,
                 timeout: Optional[float] = None) -> dict:
     """Open ``photo`` in Photoshop, select ``area``, remove it and save to ``output``.
 
-    If Photoshop opens the photo at another size than ``area.image_size``, the
-    shapes are placed according to ``area.fit``. Returns the script's report
-    (``output``, ``warnings``, ...).
+    With an :class:`AreaSet` the area drawn for the photo's orientation is used.
+    If Photoshop opens the photo at another size than that area's
+    ``image_size``, the shapes are placed according to its ``fit``. Returns the
+    script's report (``output``, ``warnings``, ...).
     """
     options = options or RemoveOptions()
     photo = Path(photo)
@@ -135,18 +136,18 @@ def remove_area(photo, area: Area, output=None, options: Optional[RemoveOptions]
     return run_jsx(build_script(config), photoshop=photoshop, timeout=timeout)
 
 
-def build_open_config(photo, area: Optional[Area] = None, options: Optional[RemoveOptions] = None,
+def build_open_config(photo, area: Union[Area, AreaSet, None] = None, options: Optional[RemoveOptions] = None,
                       report: str = "return") -> dict:
     """Job description for opening a photo, with ``area`` selected if given."""
     options = options or RemoveOptions()
     config = {"action": "open", "input": _abspath(photo), "report": report}
-    if area is not None and has_area(area.shapes):
+    if area is not None and area_has_shapes(area):
         options.validate()
         config.update(_area_config(area), expand=int(options.expand), feather=float(options.feather))
     return config
 
 
-def open_photo(photo, area: Optional[Area] = None, options: Optional[RemoveOptions] = None,
+def open_photo(photo, area: Union[Area, AreaSet, None] = None, options: Optional[RemoveOptions] = None,
                photoshop: Optional[str] = None, timeout: Optional[float] = None) -> dict:
     """Start Photoshop (if needed) and open ``photo``.
 
@@ -214,7 +215,12 @@ def export_script(path, config: dict) -> Path:
     return path
 
 
-def _area_config(area: Area) -> dict:
+def _area_config(area: Union[Area, AreaSet]) -> dict:
+    """Config keys describing what to select; the script picks per orientation."""
+    if isinstance(area, AreaSet):
+        if len(area.areas) == 1:
+            return _area_config(next(iter(area.areas.values())))
+        return {"ops": [], "areas": [dict(_area_config(a), when=o) for o, a in area.areas.items()]}
     size = area.image_size
     return {
         "ops": selection_ops(area.shapes),
