@@ -199,6 +199,20 @@ class AppTests(unittest.TestCase):
             self.wait_idle()
         self.assertIn("세트가 없습니다", app.action_status.get())
 
+    def test_removal_settings_are_remembered(self):
+        app = self.app
+        app.method.set("action")
+        app.expand.set("9")
+        app.keep_open.set(False)
+        app.action_name.set("지우기")
+        app.save_preferences()
+        other = gui.RemoverApp(tk.Toplevel(self.root))
+        self.assertEqual((other.method.get(), other.expand.get(), other.keep_open.get(), other.action_name.get()),
+                         ("action", "9", False, "지우기"))
+        settings.save_settings("main", {"method": "nonsense", "expand": 3})
+        third = gui.RemoverApp(tk.Toplevel(self.root))
+        self.assertEqual((third.method.get(), third.expand.get()), ("content-aware", "4"))  # bad values ignored
+
     def test_save_and_apply_common_area(self):
         app = self.app
         self.drag((650, 500), (790, 590))  # bottom-right corner

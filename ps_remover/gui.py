@@ -124,6 +124,9 @@ class RemoverApp:
         self.preset = tk.StringVar()
         self._batch_window: Optional[BatchWindow] = None
         self.status = tk.StringVar(value="[사진 열기]로 지울 부분이 있는 사진을 고르세요.")
+        # The tool is used again and again, so the removal settings carry over to the next run.
+        self._restore_preferences()
+        root.protocol("WM_DELETE_WINDOW", self.close)
 
         self._build_menu()
         self._build_toolbar()
@@ -150,7 +153,7 @@ class RemoverApp:
         file_menu.add_command(label="선택 영역 불러오기...", command=self.load_selection)
         file_menu.add_command(label="Photoshop 스크립트(.jsx)로 내보내기...", command=self.export_jsx)
         file_menu.add_separator()
-        file_menu.add_command(label="끝내기", command=self.root.destroy)
+        file_menu.add_command(label="끝내기", command=self.close)
         menubar.add_cascade(label="파일", menu=file_menu)
         edit_menu = tk.Menu(menubar, tearoff=False)
         edit_menu.add_command(label="되돌리기", accelerator=f"{accel}+Z", command=self.undo)
@@ -600,6 +603,7 @@ class RemoverApp:
     def _start(self, message: str, job: Callable[[], dict], on_success: Callable[[dict], None]) -> None:
         self._set_busy(True)
         self.status.set(message)
+        self.save_preferences()
 
         def work() -> None:
             try:
@@ -665,6 +669,32 @@ class RemoverApp:
             text = f"예상하지 못한 오류가 났습니다: {error!r}"
         self.status.set("실패: " + text.splitlines()[0])
         messagebox.showerror(APP_TITLE, text)
+
+    # ------------------------------------------------------ preferences
+
+    _TEXT_PREFERENCES = ("method", "action_set", "action_name", "expand", "feather", "preset")
+    _FLAG_PREFERENCES = ("subject", "keep_open")
+
+    def _restore_preferences(self) -> None:
+        saved = settings.load_settings("main")
+        for name in self._TEXT_PREFERENCES:
+            value = saved.get(name)
+            if isinstance(value, str) and value.strip() and (name != "method" or value in api.METHODS):
+                getattr(self, name).set(value)
+        for name in self._FLAG_PREFERENCES:
+            if isinstance(saved.get(name), bool):
+                getattr(self, name).set(saved[name])
+
+    def save_preferences(self) -> None:
+        values = {name: getattr(self, name).get() for name in self._TEXT_PREFERENCES + self._FLAG_PREFERENCES}
+        try:
+            settings.save_settings("main", values)
+        except OSError:
+            pass  # remembering the choices is a convenience
+
+    def close(self) -> None:
+        self.save_preferences()
+        self.root.destroy()
 
     # ------------------------------------------------------ common areas
 
@@ -1002,6 +1032,7 @@ class BatchWindow:
             messagebox.showerror("여러 사진 한꺼번에 지우기", str(exc), parent=self.window)
             return
         self._save_settings()
+        self.app.save_preferences()
         self.method.set(self.app.method_summary())
         self._runner = BatchRunner(job, self._events.put)
         self._log(f"시작: {job.input_dir} → {job.output_dir} ('{self.preset.get()}', {self.method.get()})")
