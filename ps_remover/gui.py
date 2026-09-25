@@ -1179,6 +1179,9 @@ class BatchWindow:
             self._log(f"실패  {event['photo'].name}: {event['error']}")
         elif kind == "error":
             self._log(f"오류  {event['error']}")
+            if event.get("retry"):
+                self._log("      Photoshop 문제를 해결하면 저절로 다시 이어서 지웁니다.")
+                self.status.set("Photoshop 문제로 멈춰 있습니다. 기록의 안내를 확인하세요. 해결되면 저절로 이어서 지웁니다.")
         elif kind == "waiting":
             self._log("새 사진을 기다리는 중...")
             self.status.set("새 사진을 기다리고 있습니다. 사진 폴더에 사진이 들어오면 바로 지웁니다.")

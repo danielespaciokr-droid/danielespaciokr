@@ -18,14 +18,14 @@ DEFAULT_ACTION_NAME = "제거"
 # Photoshop cannot press Contextual Task Bar buttons from a script, but it can
 # play an Action in which the user recorded pressing one.
 ACTION_SETUP_HELP = f"""\
-Photoshop 작업 표시줄의 [제거] 버튼을 쓰려면 한 번만 동작으로 녹화해 두세요:
-  1. 지울 부분이 선택된 사진을 Photoshop에 띄웁니다. 이 도구에서 영역을 그리거나 공통 영역을 적용한 뒤
-     [① Photoshop에서 열기]를 누르면, 사진이 열리고 그 영역이 선택됩니다.
-     (명령줄: ps-remover open 사진.jpg --preset 공통영역이름)
+Photoshop 작업 표시줄의 [제거] 버튼을 쓰려면 Photoshop에서 한 번만 녹화해 두세요:
+  1. Photoshop에서 아무 사진이나 열고, 사각형 선택 윤곽 도구(M)로 아무 부분이나 드래그해 선택합니다.
+     선택은 녹화를 시작하기 전에 합니다. (선택까지 녹화되면 늘 그 자리만 지워집니다.)
   2. [창 > 동작]을 엽니다 (단축키 Windows: Alt+F9, macOS: Option+F9).
-     동작 패널 아래의 폴더 아이콘을 눌러 새 세트를 '{DEFAULT_ACTION_SET}' 이름으로 만듭니다.
-  3. 그 세트에 새 동작을 '{DEFAULT_ACTION_NAME}' 이름으로 만들고 [기록]을 누릅니다.
-  4. 작업 표시줄의 [제거] 버튼을 누르고, 결과가 나오면 동작 패널의 정지(■) 버튼을 누릅니다."""
+  3. 동작 패널 아래의 폴더 아이콘(새 세트 만들기)을 누르고 이름을 '{DEFAULT_ACTION_SET}'로 합니다.
+  4. + 아이콘(새 동작 만들기)을 누르고 이름을 '{DEFAULT_ACTION_NAME}'로 한 뒤 [기록]을 누릅니다.
+  5. 작업 표시줄의 [제거] 버튼을 누르고, 결과가 나오면 동작 패널의 정지(■) 버튼을 누릅니다.
+  6. 동작 패널의 '{DEFAULT_ACTION_NAME}' 아래에 단계가 생겼으면 끝입니다. 연습한 사진은 저장하지 않고 닫습니다."""
 SAVE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".psd")
 TRANSPARENCY_EXTENSIONS = (".png", ".tif", ".tiff", ".psd")
 DEFAULT_SUFFIX = "_removed"

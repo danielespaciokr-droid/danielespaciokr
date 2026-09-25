@@ -302,6 +302,8 @@ class _BatchReport:
             _error(f"{event['photo'].name}: {event['error']}")
         elif kind == "error":
             _error(event["error"])
+            if event.get("retry"):
+                print("    Photoshop 문제가 해결되면 저절로 이어서 지웁니다.", flush=True)
         elif kind == "waiting":
             print("새 사진을 기다리는 중입니다... (끝내려면 Ctrl+C)", flush=True)
         elif kind == "finished":

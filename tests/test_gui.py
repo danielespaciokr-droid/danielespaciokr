@@ -384,6 +384,15 @@ class AppTests(unittest.TestCase):
         showinfo.assert_not_called()
         self.assertIn("폴더를 고르세요", window.status.get())
 
+    def test_batch_window_says_it_will_carry_on_after_photoshop_trouble(self):
+        self.app.open_batch_window()
+        window = self.app._batch_window
+        window._handle({"type": "error", "error": "Photoshop에 연결하지 못했습니다 (0x80080005).", "retry": True})
+        log = window.log.get("1.0", "end")
+        self.assertIn("0x80080005", log)
+        self.assertIn("저절로 다시 이어서 지웁니다", log)
+        self.assertIn("Photoshop 문제", window.status.get())
+
     def wait_idle(self):
         for _ in range(100):
             self.pump(0.05)

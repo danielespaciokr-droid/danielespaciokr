@@ -211,7 +211,7 @@ class BatchRunnerTests(BatchTestCase):
         remove = FakeRemove({"b.jpg": [PhotoshopError("잠깐 바쁨")]})  # the first try on b.jpg hits a busy Photoshop
         events = []
         runner = batch.BatchRunner(self.job(), events.append, remove=remove)
-        with mock.patch.object(batch, "SETTLE_SECONDS", 0):
+        with mock.patch.object(batch, "SETTLE_SECONDS", 0), mock.patch.object(batch, "RETRY_MIN_SECONDS", 0):
             thread = threading.Thread(target=runner.run, kwargs={"watch": True, "interval": 0.05})
             thread.start()
             self._wait_for(lambda: any(e["type"] == "waiting" for e in events))
@@ -225,6 +225,30 @@ class BatchRunnerTests(BatchTestCase):
         self.assertIn("error", types)
         self.assertEqual(types[-1], "finished")
         self.assertEqual(events[-1]["failed"], 0)
+
+    def test_repeated_photoshop_errors_back_off_and_are_reported_once(self):
+        self.photo("a.jpg")
+        errors = [PhotoshopError("관리자 권한 문제")] * 5 + [PhotoshopError("대화상자가 열려 있음")]
+        remove = FakeRemove({"a.jpg": list(errors)})
+        events = []
+        runner = batch.BatchRunner(self.job(), events.append, remove=remove)
+        waits = []
+        real_wait = runner._stop.wait
+
+        def wait(timeout=None):
+            waits.append(timeout)
+            if runner.done:
+                runner.stop()  # the photo got through at last: enough seen
+            return real_wait(0)
+
+        runner._stop.wait = wait
+        runner.run(watch=True, interval=1)
+        self.assertEqual(runner.done, 1)
+        self.assertEqual(len(remove.calls), 7)
+        self.assertEqual([(e["error"], e["retry"]) for e in events if e["type"] == "error"],
+                         [("관리자 권한 문제", True), ("대화상자가 열려 있음", True)])
+        self.assertEqual([w for w in waits if w >= 5], [5, 10, 20, 40, 60, 60])  # doubling, at most a minute
+        self.assertEqual((runner._retries, runner._last_error), (0, None))  # a success starts over
 
     def test_stop_before_next_photo(self):
         for name in ("a.jpg", "b.jpg", "c.jpg"):

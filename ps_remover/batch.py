@@ -25,6 +25,8 @@ DEFAULT_WATCH_INTERVAL = 1.0  # seconds between looks at the folder in watch mod
 SETTLE_POLL_SECONDS = 0.5  # how soon to look again at a photo that may still be copying
 SETTLE_SECONDS = 0.5  # a photo must also be this long untouched
 BUSY_GIVE_UP_SECONDS = 60.0  # a single run gives up on a photo that stays busy this long
+RETRY_MIN_SECONDS = 5.0  # watch mode: first wait after a Photoshop error, doubled while errors go on
+RETRY_MAX_SECONDS = 60.0
 
 Snapshot = Tuple[int, float]  # (size, modification time)
 
@@ -101,7 +103,8 @@ class BatchRunner:
       start     photo, index, count     about to process a photo of this round
       done      photo, result
       failed    photo, error, result    that photo failed (it is not retried); the run goes on
-      error     error                   Photoshop trouble; watch mode tries again later
+      error     error, retry            Photoshop trouble; with retry (watch mode) it is tried again
+                                        later, and the same error is not reported twice in a row
       waiting                           watch mode: no new photos right now
       finished  done, failed, error     the run is over
     """
@@ -116,6 +119,8 @@ class BatchRunner:
         self.done = 0
         self._snapshots: Dict[Path, Snapshot] = {}
         self._busy_since: Dict[Path, float] = {}
+        self._retries = 0  # Photoshop errors in a row
+        self._last_error: Optional[str] = None
 
     def stop(self) -> None:
         """Finish the photo in progress, then end the run."""
@@ -136,7 +141,10 @@ class BatchRunner:
                 if status == "fatal":
                     break
                 if status == "retry":
-                    self._stop.wait(interval)
+                    # Photoshop needs the user (a dialog, privileges, ...): ask it less and less often.
+                    delay = max(interval, RETRY_MIN_SECONDS) * 2 ** self._retries
+                    self._retries += 1
+                    self._stop.wait(min(delay, RETRY_MAX_SECONDS))
                 continue  # look again at once: more photos may have arrived meanwhile
             if settling:
                 self._stop.wait(SETTLE_POLL_SECONDS)
@@ -187,17 +195,20 @@ class BatchRunner:
             except ScriptFailed as exc:
                 self._fail(photo, str(exc), exc.result)
             except (PhotoshopNotFound, UnsupportedPlatform) as exc:
-                self._emit("error", error=str(exc))
+                self._emit("error", error=str(exc), retry=False)
                 return "fatal", str(exc)
             except PhotoshopError as exc:
                 # Busy, timed out, ...: nothing wrong with the photo itself.
-                self._emit("error", error=str(exc))
+                if str(exc) != self._last_error or not watch:
+                    self._emit("error", error=str(exc), retry=watch)
+                self._last_error = str(exc)
                 return ("retry", str(exc)) if watch else ("fatal", str(exc))
             except Exception as exc:  # noqa: BLE001 - one bad photo must not end a long run
                 self._fail(photo, str(exc) or exc.__class__.__name__, None)
             else:
                 self.handled.add(photo)
                 self.done += 1
+                self._retries, self._last_error = 0, None
                 self._emit("done", photo=photo, result=result)
         return "ok", None
 
