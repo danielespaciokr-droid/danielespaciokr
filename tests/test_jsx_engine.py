@@ -551,18 +551,39 @@ class JsxEngineTests(unittest.TestCase):
         self.assertEqual(self.actions(out), [])
 
     def test_open_with_area_selects_it(self):
-        area = shapes.Area([shapes.rect(3500, 2800, 3980, 2980)], (4000, 3000), "anchor")
+        area = shapes.Area([shapes.rect(2500, 1800, 3500, 2500)], (4000, 3000), "anchor")
         config = api.build_open_config("photo.jpg", area, api.RemoveOptions(expand=2))
         config["input"] = PHOTO
         out = self.run_script(config, images={PHOTO: {"width": 3000, "height": 4000, "resolution": 300}})
         report = out["report"]
         self.assertTrue(report["ok"], report.get("error"))
-        self.assertEqual(report["selectionBounds"], [2498, 3798, 2982, 3982])
+        self.assertEqual(report["selectionBounds"], [1498, 2798, 2502, 3502])
         self.assertEqual(self.calls(out, "suspendHistory")[0][2], "영역 선택 (ps-remover)")
         self.assertEqual(self.actions(out, "Fl  "), [])
         self.assertEqual(self.calls(out, "saveAs"), [])
-        self.assertEqual(out["documents"][0]["selection"], [2498, 3798, 2982, 3982])  # left selected
+        self.assertEqual(out["documents"][0]["selection"], [1498, 2798, 2502, 3502])  # left selected
         self.assertEqual(out["documents"][0]["resolution"], 300)
+
+    def test_area_against_an_edge_keeps_to_it(self):
+        # Drawn around Getty Images' credit box on a 2000x1333 photo, a little short of the right edge:
+        # on photos of other sizes it still reaches the right edge, as in Python.
+        getty = [shapes.rect(1190, 806, 1985, 972)]
+        area = shapes.Area(getty, (2000, 1333), "anchor")
+        config = remove_config(getty, api.RemoveOptions(expand=0), image_size=(2000, 1333), fit="anchor")
+        self.assertEqual((config["glue"], config["anchor"][0]), ([False, False, True, False], 1.0))
+        for size in ((2000, 1333), (1335, 2000), (3000, 2000)):
+            with self.subTest(size=size):
+                out = self.run_script(config, images={PHOTO: {"width": size[0], "height": size[1]}})
+                report = out["report"]
+                self.assertTrue(report["ok"], report.get("error"))
+                expected = [round(v, 3) for v in shapes.bounds(area.on_photo(size))]
+                self.assertEqual([round(v, 3) for v in report["selectionBounds"]], expected)
+                self.assertEqual(expected[2], size[0])
+        # A corner is kept too: the area is filled out to both edges.
+        corner = remove_config([shapes.rect(3500, 2800, 3980, 2980)], api.RemoveOptions(expand=0),
+                               image_size=(4000, 3000), fit="anchor")
+        out = self.run_script(corner, images={PHOTO: {"width": 3000, "height": 4000}})
+        self.assertEqual(out["report"]["selectionBounds"], [2500, 3800, 3000, 4000])
 
     def test_remove_current_selection(self):
         config = api.build_remove_current_config(api.RemoveOptions(), output=None)

@@ -240,23 +240,70 @@ class AppTests(unittest.TestCase):
         self.assertEqual([s.box for s in app.shapes], [(590, 550, 790, 595)])
         self.assertIn("글자를 찾았습니다 (가로 180 x 세로 25 px)", app.status.get())
         # With a common area chosen, the text is looked for where that area expects it.
-        settings.save_preset("글씨", shapes.Area([shapes.rect(700, 560, 790, 590)], (800, 600), "anchor"))
+        settings.save_preset("글씨", shapes.Area([shapes.rect(600, 450, 700, 500)], (800, 600), "anchor"))
         app._refresh_presets(select="글씨")
         missed = gui.textfind.Placement(settings.load_preset("글씨").for_size((800, 600)), None, "글자 못 찾음")
         with mock.patch.object(gui.textfind, "place", return_value=missed) as place:
             app.find_text_here()
             self.wait_idle()
         self.assertEqual(set(place.call_args.args[1].areas), {"landscape"})
-        self.assertEqual([s.box for s in app.shapes], [(700, 560, 790, 590)])  # where it was saved
+        self.assertEqual([s.box for s in app.shapes], [(600, 450, 700, 500)])  # where it was saved
         self.assertIn("글자를 찾지 못해서", app.status.get())
         with mock.patch.object(gui.textfind, "available", return_value=False), \
                 mock.patch.object(gui.messagebox, "showinfo") as showinfo:
             app.find_text_here()
         self.assertIn("numpy", showinfo.call_args.args[1])
 
+    def test_find_a_credit_box_here(self):
+        app = self.app
+        area = shapes.Area([shapes.rect(470, 380, 800, 450)], (800, 600), "anchor", band_box=(480, 390, 800, 440))
+        settings.save_preset("게티", area)
+        app._refresh_presets(select="게티")
+        found = gui.textfind.FoundBox((480.0, 392.0, 800.0, 440.0), 2, 0.3)
+        box = gui.textfind.Placement(shapes.Area([shapes.rect(476, 388, 804, 444)], (800, 600)), found, "상자 찾음", "box")
+        with mock.patch.object(gui.textfind, "place", return_value=box):
+            app.find_text_here()
+            self.wait_idle()
+        self.assertEqual([s.box for s in app.shapes], [(476, 388, 804, 444)])
+        self.assertIn("워터마크 상자를 찾았습니다 (가로 320 x 세로 48 px)", app.status.get())
+        saved = settings.load_preset("게티").for_size((800, 600))
+        with mock.patch.object(gui.textfind, "place", return_value=gui.textfind.Placement(saved, None, "상자 못 찾음", "box")):
+            app.find_text_here()
+            self.wait_idle()
+        self.assertEqual(shapes.bounds(app.shapes), (470, 380, 800, 450))  # as saved, out to the right edge
+        self.assertIn("워터마크 상자를 찾지 못해서", app.status.get())
+
+    def test_saving_an_area_on_the_edge_remembers_the_box(self):
+        app = self.app
+        self.drag((520, 380), (900, 450))  # past the photo's right edge
+        drawn = app.shapes[0].box
+        self.assertGreaterEqual(drawn[2], 800)
+        with mock.patch.object(gui.textfind, "learn_band_box", return_value=(480.0, 390.0, 800.0, 440.0)) as learn, \
+                mock.patch.object(gui.textfind, "learn_text_box") as learn_text:
+            dialog = app.save_preset()
+            dialog.name.set("게티")
+            dialog.save()
+        self.assertEqual(learn.call_args.args[0], self.photo)
+        learn_text.assert_not_called()  # the credit's text is not followed on the edge
+        saved = settings.load_preset("게티").for_orientation("landscape")
+        self.assertEqual((saved.band_box, saved.text_box), ((480.0, 390.0, 800.0, 440.0), None))
+        self.assertIn("워터마크 상자(가로 320 x 세로 50 px)도 기억해서", app.status.get())
+        with mock.patch.object(gui.textfind, "learn_band_box", return_value=None):
+            dialog = app.save_preset()
+            dialog.name.set("상자 없음")
+            dialog.save()
+        self.assertIsNone(settings.load_preset("상자 없음").for_orientation("landscape").band_box)
+        self.assertIn("사진 끝까지 지웁니다", app.status.get())
+        app.open_batch_window()
+        window = app._batch_window
+        window.preset.set("게티")
+        window._show_area_info()
+        self.assertIn("상자 위치 기억함", window.area_info.get())
+        window.close()
+
     def test_saving_a_common_area_remembers_where_the_text_is(self):
         app = self.app
-        self.drag((600, 540), (780, 590))
+        self.drag((600, 520), (760, 570))  # clear of the photo's edges
         with mock.patch.object(gui.textfind, "learn_text_box", return_value=(610.0, 550.0, 770.0, 580.0)) as learn:
             dialog = app.save_preset()
             dialog.name.set("글씨")
@@ -498,8 +545,9 @@ class AppTests(unittest.TestCase):
         self.assertEqual((options.adjust, options.adjust_name), (True, "필름"))
         log = window.log.get("1.0", "end")
         self.assertIn("지우기 + 보정)", log)
-        # The text is looked for by default; a plain test photo has none, so the saved area was used.
-        self.assertIn("완료  a.jpg → a_removed.jpg (가로 사진용 영역, 글자 못 찾음: 저장된 위치, 보정)", log)
+        # The credit is looked for by default (a box, the area being on the photo's edge); a plain test
+        # photo has none, so the saved area was used.
+        self.assertIn("완료  a.jpg → a_removed.jpg (가로 사진용 영역, 상자 못 찾음: 저장된 위치, 보정)", log)
         self.assertTrue(settings.load_settings("batch")["adjust"])
         # Everything shown in the window also goes to today's log file.
         logs = list(settings.log_dir().glob("auto-*.log"))

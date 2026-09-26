@@ -32,8 +32,10 @@ var PSR_DEFAULTS = {
     expectedSize: null,         // [width, height] the shapes were drawn against
     fit: "exact",               // how to place them on other sizes, see psrShapeTransform()
     anchor: null,               // fit "anchor": [0..1, 0..1], e.g. [1, 1] = bottom-right corner
-    areas: null,                // instead of the four keys above: [{when: "landscape" | "portrait",
-                                //   ops, expectedSize, fit, anchor}, ...], chosen by the photo's shape
+    glue: null,                 // [left, top, right, bottom]: edges of its photo the area touches, and
+    bounds: null,               //   the box around the area: it is filled out to those edges on any photo
+    areas: null,                // instead of the six keys above: [{when: "landscape" | "portrait",
+                                //   ops, expectedSize, fit, anchor, glue, bounds}, ...], chosen by the photo's shape
     method: "content-aware",    // "content-aware" | "action" | "transparent"
     actionSet: "ps-remover",    // method "action": the recorded Photoshop action to play,
     actionName: "제거",          // e.g. a click on the Contextual Task Bar's Remove button
@@ -113,7 +115,7 @@ function psrActionRemove(cfg, result, job) {
     var transform = psrShapeTransform(doc, area, result);
     psrPrepareDocument(doc, cfg, result);
     psrAtPixelResolution(doc, function () {
-        psrBuildSelection(doc, psrTransformOps(area.ops, transform), cfg.subject, result);
+        psrBuildSelection(doc, psrPlaceOps(doc, area, transform), cfg.subject, result);
         psrRefineSelection(doc, cfg);
         result.selectionBounds = psrSelectionBounds(doc);
         psrRemoveSelected(doc, cfg, result);
@@ -149,7 +151,7 @@ function psrActionOpen(cfg, result) {
         var transform = psrShapeTransform(doc, area, result);
         psrInHistory(doc, PSR_SELECT_HISTORY_NAME, function () {
             psrAtPixelResolution(doc, function () {
-                psrBuildSelection(doc, psrTransformOps(area.ops, transform), false, result);
+                psrBuildSelection(doc, psrPlaceOps(doc, area, transform), false, result);
                 psrRefineSelection(doc, cfg);
                 result.selectionBounds = psrSelectionBounds(doc);
             });
@@ -334,7 +336,7 @@ function psrShapeTransform(doc, cfg, result) {
     if (cfg.fit == "stretch") return [width / w, height / h, 0, 0];
     if (cfg.fit == "anchor") {
         var anchor = cfg.anchor || [0.5, 0.5];
-        var s = Math.min(width, height) / Math.min(w, h);
+        var s = Math.max(width, height) / Math.max(w, h); // credits go with the longer side
         return [s, s, anchor[0] * (width - s * w), anchor[1] * (height - s * h)];
     }
     var ratio = (width / height) / (w / h);
@@ -346,6 +348,24 @@ function psrShapeTransform(doc, cfg, result) {
     }
     result.warnings.push("Photoshop에서 연 사진 크기(" + width + "x" + height + ")에 맞게 선택 영역 좌표를 조정했습니다.");
     return [width / w, height / h, 0, 0];
+}
+
+// The area's shapes on this photo, filled out to the photo edges it touched where it
+// was drawn (keep in sync with Area.on_photo() in shapes.py).
+function psrPlaceOps(doc, area, t) {
+    var ops = psrTransformOps(area.ops, t);
+    var glue = area.glue, b = area.bounds;
+    if (!glue || !b || !ops.length) return ops;
+    var width = psrPx(doc.width), height = psrPx(doc.height);
+    var x0 = b[0] * t[0] + t[2], y0 = b[1] * t[1] + t[3], x1 = b[2] * t[0] + t[2], y1 = b[3] * t[1] + t[3];
+    var nx0 = glue[0] ? 0 : x0, ny0 = glue[1] ? 0 : y0, nx1 = glue[2] ? width : x1, ny1 = glue[3] ? height : y1;
+    var fill = [];
+    if (glue[2] && x1 < width) fill.push([x1 - 1, ny0, width, ny1]);
+    if (glue[0] && x0 > 0) fill.push([0, ny0, x0 + 1, ny1]);
+    if (glue[3] && y1 < height) fill.push([nx0, y1 - 1, nx1, height]);
+    if (glue[1] && y0 > 0) fill.push([nx0, 0, nx1, y0 + 1]);
+    for (var i = 0; i < fill.length; i++) ops = ops.concat([{ op: "rect", mode: "add", box: fill[i] }]);
+    return ops;
 }
 
 function psrTransformOps(ops, t) {

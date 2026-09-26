@@ -9,7 +9,7 @@ from typing import Optional, Union
 
 from .photoshop import run_jsx
 from .script import build_script
-from .shapes import Area, AreaSet, area_has_shapes, selection_ops
+from .shapes import Area, AreaSet, area_has_shapes, bounds, selection_ops
 
 METHODS = ("content-aware", "action", "transparent")
 DEFAULT_ACTION_SET = "ps-remover"
@@ -242,12 +242,18 @@ def _area_config(area: Union[Area, AreaSet]) -> dict:
             return _area_config(next(iter(area.areas.values())))
         return {"ops": [], "areas": [dict(_area_config(a), when=o) for o, a in area.areas.items()]}
     size = area.image_size
-    return {
+    anchor = area.placing_anchor()
+    config = {
         "ops": selection_ops(area.shapes),
         "expectedSize": [size[0], size[1]] if size else None,
         "fit": area.fit,
-        "anchor": list(area.anchor) if area.anchor is not None else None,
+        "anchor": list(anchor) if anchor is not None else None,
     }
+    sides = area.glued_sides()
+    if any(sides):
+        # The script fills the area out to these edges on photos of other sizes (see Area.on_photo()).
+        config.update(glue=list(sides), bounds=list(bounds(area.shapes)))
+    return config
 
 
 def _abspath(path) -> str:

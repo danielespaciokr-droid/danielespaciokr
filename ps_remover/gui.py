@@ -89,8 +89,10 @@ HELP_TEXT = """\
   폴더에 사진이 들어올 때마다 1초 안팎에 그 영역을 선택해 지우고 저장합니다.
   다음부터는 auto_windows.bat(macOS는 auto_mac.command)만 실행하면 바로 시작합니다.
   [이 사진에 적용]을 누르면 공통 영역이 지금 사진의 어디에 놓이는지 볼 수 있습니다.
-  [글자 찾아 적용]을 누르면 사진 오른쪽 아래의 글자를 찾아 그 자리에 영역을 놓습니다.
-  폴더 자동 처리도 사진마다 이렇게 글자를 찾아 맞추고, 못 찾으면 저장된 위치를 지웁니다.
+  [워터마크 찾아 적용]을 누르면 이 사진의 워터마크를 찾아 그 자리에 영역을 놓습니다.
+  사진 가장자리에 붙여 그린 영역은 그 자리의 반투명 상자(Getty Images 등)를,
+  아니면 오른쪽 아래 글자를 찾습니다. (상자는 사진 끝까지 그리세요)
+  폴더 자동 처리도 사진마다 이렇게 찾아 맞추고, 못 찾으면 저장된 위치를 지웁니다.
 
 Photoshop 작업 표시줄의 [제거] 버튼으로 지우려면
   지우는 방식에서 'Photoshop [제거] 버튼'을 고르세요.
@@ -274,7 +276,7 @@ class RemoverApp:
         self.preset_box = ttk.Combobox(common, textvariable=self.preset, state="readonly", width=18)
         self.preset_box.pack(side=tk.LEFT)
         ttk.Button(common, text="이 사진에 적용", command=self.apply_preset).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(common, text="글자 찾아 적용", command=self.find_text_here).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(common, text="워터마크 찾아 적용", command=self.find_text_here).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(common, text="지금 영역 저장...", command=self.save_preset).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(common, text="삭제", command=self.delete_preset).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(common, text="폴더 자동 처리...", style="Accent.TButton",
@@ -794,7 +796,7 @@ class RemoverApp:
                             f"({area.describe()}). 위치가 다르면 여기서 다시 그리고 같은 이름으로 저장하세요.")
 
     def find_text_here(self) -> None:
-        """Put the area on the text found in this photo, the way the folder watcher does."""
+        """Put the area on the credit (box or text) found in this photo, the way the folder watcher does."""
         if self._busy:
             return
         if self.photo_path is None or self.image_size is None:
@@ -810,11 +812,22 @@ class RemoverApp:
             messagebox.showerror(APP_TITLE, str(exc))
             return
         photo = self.photo_path
-        self._start("사진에서 글자를 찾는 중입니다...", lambda: {"placement": textfind.place(photo, area)},
+        self._start("사진에서 워터마크를 찾는 중입니다...", lambda: {"placement": textfind.place(photo, area)},
                     lambda result: self._text_found(result["placement"], name))
 
     def _text_found(self, placement: "textfind.Placement", name: str) -> None:
         found = placement.found
+        if placement.kind == "box":
+            if found is None:
+                self.shapes = placement.area.on_photo(self.image_size)
+                self.status.set(f"워터마크 상자를 찾지 못해서 공통 영역 '{name}'을(를) 저장된 위치(사진 끝까지)에 "
+                                "놓았습니다. 폴더 자동 처리에서도 이런 사진은 저장된 위치를 지웁니다.")
+            else:
+                self.shapes = list(placement.area.shapes)  # already in this photo's pixels
+                self.status.set(f"워터마크 상자를 찾았습니다 (가로 {found.width:.0f} x 세로 {found.height:.0f} px). "
+                                "상자와 둘레 몇 픽셀을 지울 영역으로 놓았습니다. 폴더 자동 처리도 사진마다 이렇게 합니다.")
+            self._schedule_render()
+            return
         if found is None:
             if placement.area is None:
                 self.status.set("오른쪽 아래에서 글자를 찾지 못했습니다. 지울 부분을 직접 그려 주세요.")
@@ -1031,9 +1044,12 @@ class PresetDialog:
         anchor = next(key for key, text in sh.ANCHOR_LABELS.items() if text == self.anchor.get())
         try:
             area = sh.Area(list(self.app.shapes), self.app.image_size, fit, anchor if fit == "anchor" else None)
-            text_box = self._find_text_in(area)
-            if text_box:
-                area = dataclasses.replace(area, text_box=text_box)
+            glued = any(area.glued_sides())
+            # Drawn against the photo's edge: a credit box there is looked for (its text is not followed).
+            band_box = self._learn(textfind.learn_band_box, area) if glued else None
+            text_box = None if glued else self._learn(textfind.learn_text_box, area)
+            if band_box or text_box:
+                area = dataclasses.replace(area, band_box=band_box, text_box=text_box)
             existing = settings.load_preset(existing_name) if existing_name else None
             if existing and self.orientation in existing.areas and not messagebox.askyesno(
                     "공통 영역 저장", f"'{name}'의 {label}용 영역을 새로 그린 영역으로 바꿀까요?", parent=self.window):
@@ -1051,17 +1067,24 @@ class PresetDialog:
             other = "세로" if self.orientation == "landscape" else "가로"
             done = (f"{other} 사진의 영역이 다르다면 {other} 사진을 열어 영역을 그리고 "
                     f"같은 이름으로 한 번 더 저장하세요.")
-        if text_box:
+        if band_box:
+            width, height = band_box[2] - band_box[0], band_box[3] - band_box[1]
+            done = (f"영역 안의 워터마크 상자(가로 {width:.0f} x 세로 {height:.0f} px)도 기억해서, 다른 사진에서는 "
+                    f"사진마다 상자를 찾아 조금 여유 있게 지웁니다. {done}")
+        elif glued:
+            done = (f"사진 끝에 붙은 영역이라 다른 사진에서도 사진 끝까지 지웁니다. (영역 안에서 반투명 상자는 "
+                    f"찾지 못했습니다) {done}")
+        elif text_box:
             done = f"영역 안의 글자 위치도 기억해서, 다른 사진에서는 글자를 찾아 그만큼 떨어진 곳을 지웁니다. {done}"
         self.app.status.set(f"공통 영역 '{name}'의 {label}용 영역을 저장했습니다. {done}")
         self.window.destroy()
 
-    def _find_text_in(self, area: sh.Area) -> Optional[sh.Box]:
-        """Where the text is inside the drawn area, so other photos can be matched to it."""
+    def _learn(self, learn, area: sh.Area) -> Optional[sh.Box]:
+        """Where the credit box or text is inside the drawn area, so other photos can be matched to it."""
         if self.app.photo_path is None or not textfind.available():
             return None
         try:
-            return textfind.learn_text_box(self.app.photo_path, area)
+            return learn(self.app.photo_path, area)
         except textfind.TextFindUnavailable:
             return None
 
@@ -1165,7 +1188,7 @@ class BatchWindow:
 
         options = ttk.Frame(body)
         options.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Checkbutton(options, text="사진마다 오른쪽 아래 글자를 찾아서 영역을 맞추기 (추천)",
+        ttk.Checkbutton(options, text="사진마다 워터마크(가장자리 상자나 오른쪽 아래 글자)를 찾아서 영역을 맞추기 (추천)",
                         variable=self.find_text).pack(anchor="w", pady=(0, 4))
         watch_row = ttk.Frame(options)
         watch_row.pack(anchor="w")
@@ -1220,7 +1243,9 @@ class BatchWindow:
             this = next(iter(areas))
             other = "세로" if this == "landscape" else "가로"
             info = f"{sh.ORIENTATION_LABELS[this]}용 영역만 있습니다 ({other} 사진에는 맞춰서 씁니다)."
-        if any(area.text_box for area in areas.values()):
+        if any(area.band_box for area in areas.values()):
+            info += " 상자 위치 기억함."
+        elif any(area.text_box for area in areas.values()):
             info += " 글자 위치 기억함."
         self.area_info.set(info)
 
@@ -1311,7 +1336,7 @@ class BatchWindow:
         self._watching, self._user_stopped = watch, False
         mode = "새 사진이 들어오면 바로 처리" if watch else "지금 있는 사진만 처리"
         steps = "지우기 + 보정" if options.adjust else "지우기"
-        where = ", 글자 찾아 맞춤" if job.find_text else ""
+        where = ", 워터마크 찾아 맞춤" if job.find_text else ""
         self._log(f"시작: {job.input_dir} → {job.output_dir} ('{self.preset.get()}'{where}, {mode}, {steps})")
         if job.find_text and not textfind.available():
             self._log("참고: " + TEXTFIND_MISSING + " 그전까지는 저장된 위치를 지웁니다.")

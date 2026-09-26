@@ -29,7 +29,8 @@ EPILOG = """\
   ps-remover batch 사진폴더 --preset 워터마크 --watch --adjust
                                                         지운 뒤 녹화해 둔 보정 동작(Camera Raw 필터 등)까지 적용
   ps-remover batch 사진폴더 --preset 워터마크 --watch --find-text
-                                                        사진마다 오른쪽 아래 글자를 찾아 영역을 맞추기
+                                                        사진마다 워터마크(가장자리 상자나 오른쪽 아래 글자)를
+                                                        찾아 영역을 맞추기
   ps-remover watch                                      폴더 자동 처리 창만 열기 (저장된 설정으로 바로 시작)
   ps-remover presets                                    저장된 공통 영역 보기
   ps-remover remove 사진.jpg --rect 120,80,300,200 --method action
@@ -158,7 +159,8 @@ def _add_area_options(parser: argparse.ArgumentParser, subject: bool = True, fin
                           help="Photoshop '피사체 선택' 사용. 영역을 함께 주면 그 안의 피사체만 지움 (CC 2018 이상)")
     if find_text:
         area.add_argument("--find-text", action="store_true",
-                          help="사진마다 오른쪽 아래 글자를 찾아 영역을 그 글자에 맞춤 (못 찾으면 저장된 위치)")
+                          help="사진마다 워터마크를 찾아 영역을 맞춤: 사진 가장자리에 붙여 그린 영역은 그 자리의 "
+                               "반투명 상자(Getty Images 등)를, 아니면 오른쪽 아래 글자를 찾음 (못 찾으면 저장된 위치)")
 
 
 def _add_removal_options(parser: argparse.ArgumentParser, adjust: bool = True) -> None:
@@ -451,11 +453,11 @@ def _collect_area(args, required: bool = True):
 
 
 def _area_on(photo: Path, area):
-    """``area`` moved onto the text found in ``photo``, and a note on it."""
+    """``area`` moved onto the credit (box or text) found in ``photo``, and a note on it."""
     try:
         placement = textfind.place(photo, area if area_has_shapes(area) else None)
     except textfind.TextFindUnavailable as exc:
-        return (area if area_has_shapes(area) else None), f"글자 찾기 못 함: {exc}"
+        return (area if area_has_shapes(area) else None), f"워터마크 찾기 못 함: {exc}"
     return placement.area, placement.note
 
 

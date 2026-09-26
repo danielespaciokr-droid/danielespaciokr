@@ -181,6 +181,39 @@ class AreaTests(unittest.TestCase):
         self.assertEqual(centre.anchor, (0.5, 0.5))
         self.assertEqual(centre.on_photo((3000, 4000))[0].box, (1400, 1900, 1600, 2100))
 
+    def test_fit_anchor_goes_with_the_longer_side(self):
+        # A credit box as wide on a 2000x1333 photo as on a 1335x2000 one.
+        area = shapes.Area([shapes.rect(1000, 100, 1100, 150)], (2000, 1333), "anchor", (0.5, 0.0))
+        self.assertEqual(area.on_photo((1335, 2000))[0].box, (667.5, 100, 767.5, 150))
+        self.assertEqual(area.on_photo((1000, 667))[0].box, (500, 50, 550, 75))
+
+    def test_area_against_an_edge_keeps_to_it(self):
+        # Drawn around Getty Images' credit box, stopping a little short of the right edge.
+        area = shapes.Area([shapes.rect(1190, 806, 1985, 972)], (2000, 1333), "anchor")
+        self.assertEqual(area.glued_sides(), (False, False, True, False))
+        ax, ay = area.placing_anchor()  # on the right edge, at the same part of the height
+        self.assertEqual(ax, 1.0)
+        self.assertAlmostEqual(ay, 889 / 1333)
+        for size in ((2000, 1333), (1335, 2000), (3000, 2000), (1600, 900)):
+            with self.subTest(size=size):
+                left, top, right, bottom = shapes.bounds(area.on_photo(size))
+                self.assertEqual(right, size[0])  # filled out to the edge on every photo
+                self.assertAlmostEqual((top + bottom) / 2, size[1] * 889 / 1333, delta=1)
+                self.assertAlmostEqual(size[0] - left, 810 * max(size) / 2000, delta=0.01)
+        # A box learned inside it is placed the same way, out to the edge.
+        self.assertEqual(tuple(round(v, 1) for v in area.map_box((1200, 817, 1990, 961), (1335, 2000))),
+                         (535.0, 1261.8, 1335.0, 1405.8))
+        # Away from the edges, nothing changes.
+        middle = shapes.Area([shapes.rect(900, 600, 1100, 700)], (2000, 1333), "anchor")
+        self.assertEqual(middle.glued_sides(), (False, False, False, False))
+        self.assertEqual(len(middle.on_photo((1335, 2000))), 1)
+        self.assertEqual(shapes.Area([shapes.rect(0, 0, 10, 10)]).glued_sides(), (False,) * 4)  # size unknown
+
+    def test_glue_fill(self):
+        fill = shapes.glue_fill((True, False, False, True), (10, 20, 50, 60), (100, 80))
+        self.assertEqual([s.box for s in fill], [(0, 20, 11, 80), (0, 59, 50, 80)])  # the corner too
+        self.assertEqual(shapes.glue_fill((False, False, True, False), (10, 20, 100, 60), (100, 80)), [])
+
     def test_fit_stretch_and_exact(self):
         stretch = shapes.Area(self.WATERMARK, (4000, 3000), "stretch")
         self.assertEqual(stretch.on_photo((2000, 3000))[0].box, (1750, 2800, 1990, 2980))

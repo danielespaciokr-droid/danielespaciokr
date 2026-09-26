@@ -195,12 +195,17 @@ class Area:
                    photos are refused.
     fit "anchor":  keep the shapes' distance to ``anchor`` ((0, 0) top-left,
                    (1, 1) bottom-right, (0.5, 0.5) centre), scaled by the ratio of
-                   the shorter sides. A watermark in the bottom-right corner stays
+                   the longer sides. A watermark in the bottom-right corner stays
                    there on a portrait photo too.
     fit "stretch": scale each axis to the photo's size.
 
-    ``text_box`` is where the text to remove was on that photo, if known: the
-    area can then follow the text on other photos (see ps_remover.textfind).
+    Whatever the fit, an area that touches an edge of its photo keeps touching
+    that edge on every photo (see :meth:`glued_sides`): a credit box that
+    starts at the right edge is never cut short of it.
+
+    ``text_box`` is where the text to remove was on that photo, and
+    ``band_box`` where a see-through box (e.g. Getty Images' credit box) was,
+    if known: the area can then follow them on other photos (ps_remover.textfind).
     """
 
     shapes: List[Shape]
@@ -208,6 +213,7 @@ class Area:
     fit: str = "exact"
     anchor: Optional[Tuple[float, float]] = None
     text_box: Optional[Box] = None
+    band_box: Optional[Box] = None
 
     def __post_init__(self) -> None:
         self.shapes = list(self.shapes)
@@ -227,18 +233,63 @@ class Area:
             if not (0 <= ax <= 1 and 0 <= ay <= 1):
                 raise SelectionError("anchor 값은 0~1 사이여야 합니다.")
             self.anchor = (ax, ay)
-        if self.text_box is not None:
-            left, top, right, bottom = (_number(v) for v in self.text_box)
-            if right <= left or bottom <= top:
-                raise SelectionError("text_box는 [왼쪽, 위, 오른쪽, 아래] 형식이어야 합니다.")
-            self.text_box = (left, top, right, bottom)
+        self.text_box = _box_field(self.text_box, "text_box")
+        self.band_box = _box_field(self.band_box, "band_box")
+
+    def glued_sides(self) -> Tuple[bool, bool, bool, bool]:
+        """``(left, top, right, bottom)``: the edges of its photo the area touches.
+
+        An area within EDGE_TOUCH of an edge was drawn to it, e.g. around a
+        credit box that starts at the photo's right edge.
+        """
+        if not self.image_size or not self.shapes:
+            return (False, False, False, False)
+        width, height = self.image_size
+        x0, y0, x1, y1 = bounds(self.shapes)
+        near_x, near_y = max(4.0, EDGE_TOUCH * width), max(4.0, EDGE_TOUCH * height)
+        return (x0 <= near_x, y0 <= near_y, x1 >= width - near_x, y1 >= height - near_y)
+
+    def placing_anchor(self) -> Optional[Tuple[float, float]]:
+        """The anchor used for fit "anchor": the edges the area touches win over the saved anchor.
+
+        Along the other direction, such an area keeps its place in proportion to
+        the photo: Getty Images' box is centred at two thirds of the height on
+        every photo, on the right edge.
+        """
+        if self.fit != "anchor":
+            return self.anchor
+        ax, ay = self.anchor if self.anchor is not None else (0.5, 0.5)
+        left, top, right, bottom = sides = self.glued_sides()
+        if not any(sides):
+            return (ax, ay)
+        width, height = self.image_size
+        x0, y0, x1, y1 = bounds(self.shapes)
+        ax = 0.0 if left and not right else 1.0 if right and not left else min(1.0, max(0.0, (x0 + x1) / 2 / width))
+        ay = 0.0 if top and not bottom else 1.0 if bottom and not top else min(1.0, max(0.0, (y0 + y1) / 2 / height))
+        return (ax, ay)
+
+    def placement(self, size: Tuple[int, int]) -> Tuple[float, float, float, float]:
+        """``(sx, sy, tx, ty)`` placing the area on a photo of ``size``."""
+        if not self.image_size:
+            return (1.0, 1.0, 0.0, 0.0)
+        return fit_transform(self.image_size, size, self.fit, self.placing_anchor())
+
+    def map_box(self, box: Box, size: Tuple[int, int]) -> Box:
+        """``box`` on the area's photo placed on a photo of ``size``, reaching the edges the area touches."""
+        sx, sy, tx, ty = self.placement(size)
+        placed = (box[0] * sx + tx, box[1] * sy + ty, box[2] * sx + tx, box[3] * sy + ty)
+        return _to_edges(self.glued_sides(), placed, size)
 
     def on_photo(self, size: Tuple[int, int]) -> List[Shape]:
-        """The shapes placed on a photo of ``size`` (width, height)."""
+        """The shapes placed on a photo of ``size`` (width, height).
+
+        Keep in sync with psrPlaceOps() in jsx/ps_remover.jsx.
+        """
         if not self.image_size:
             return list(self.shapes)
-        sx, sy, tx, ty = fit_transform(self.image_size, size, self.fit, self.anchor)
-        return [shape.transformed(sx, sy, tx, ty) for shape in self.shapes]
+        sx, sy, tx, ty = self.placement(size)
+        placed = [shape.transformed(sx, sy, tx, ty) for shape in self.shapes]
+        return placed + glue_fill(self.glued_sides(), bounds(placed), size)
 
     def describe(self) -> str:
         """How the area adapts to other photos, in words."""
@@ -258,6 +309,8 @@ class Area:
             data["anchor"] = [self.anchor[0], self.anchor[1]]
         if self.text_box is not None:
             data["text_box"] = [_r(v) for v in self.text_box]
+        if self.band_box is not None:
+            data["band_box"] = [_r(v) for v in self.band_box]
         data["shapes"] = [shape.to_dict() for shape in self.shapes]
         return data
 
@@ -273,15 +326,18 @@ class Area:
         anchor = data.get("anchor")
         if anchor is not None and (not isinstance(anchor, (list, tuple)) or len(anchor) != 2):
             raise SelectionError("anchor는 [x, y] 형식이어야 합니다.")
-        text_box = data.get("text_box")
-        if text_box is not None and (not isinstance(text_box, (list, tuple)) or len(text_box) != 4):
-            raise SelectionError("text_box는 [왼쪽, 위, 오른쪽, 아래] 형식이어야 합니다.")
+        boxes = {}
+        for key in ("text_box", "band_box"):
+            value = data.get(key)
+            if value is not None and (not isinstance(value, (list, tuple)) or len(value) != 4):
+                raise SelectionError(f"{key}는 [왼쪽, 위, 오른쪽, 아래] 형식이어야 합니다.")
+            boxes[key] = tuple(value) if value is not None else None
         return cls(
             [Shape.from_dict(item) for item in data["shapes"]],
             tuple(size) if size is not None else None,
             data.get("fit", "exact"),
             tuple(anchor) if anchor is not None else None,
-            tuple(text_box) if text_box is not None else None,
+            **boxes,
         )
 
 
@@ -376,7 +432,9 @@ def fit_transform(from_size: Tuple[float, float], to_size: Tuple[float, float], 
         return (width / w, height / h, 0.0, 0.0)
     if fit == "anchor":
         ax, ay = anchor if anchor is not None else (0.5, 0.5)
-        s = min(width, height) / min(w, h)
+        # Credits and watermarks go with the photo's longer side: Getty Images' box is the same
+        # 800 pixels wide on a 2000x1333 and on a 1317x2000 photo.
+        s = max(width, height) / max(w, h)
         return (s, s, ax * (width - s * w), ay * (height - s * h))
     if abs((width / height) / (w / h) - 1) > 0.01:
         raise SelectionError(f"사진 크기({width:g}x{height:g})의 가로세로 비율이 영역을 그린 사진"
@@ -397,6 +455,48 @@ def auto_anchor(shapes: Sequence[Shape], size: Tuple[int, int]) -> Tuple[float, 
 
 def _third(value: float) -> float:
     return 0.0 if value < 1 / 3 else 0.5 if value <= 2 / 3 else 1.0
+
+
+EDGE_TOUCH = 0.02  # an area this close to an edge of its photo (part of the width or height) touches it
+
+
+def bounds(shapes: Sequence[Shape]) -> Box:
+    """The box around the shapes that add to the selection."""
+    boxes = [shape.box for shape in shapes if shape.mode == "add"] or [shape.box for shape in shapes]
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def glue_fill(sides: Tuple[bool, bool, bool, bool], placed: Box, size: Tuple[int, int]) -> List[Shape]:
+    """Rectangles from the placed area's box out to the photo edges in ``sides`` it does not reach."""
+    left, top, right, bottom = sides
+    x0, y0, x1, y1 = placed
+    width, height = size
+    nx0, ny0, nx1, ny1 = _to_edges(sides, placed, size)
+    fill = []
+    if right and x1 < width:
+        fill.append(rect(x1 - 1, ny0, width, ny1))
+    if left and x0 > 0:
+        fill.append(rect(0, ny0, x0 + 1, ny1))
+    if bottom and y1 < height:
+        fill.append(rect(nx0, y1 - 1, nx1, height))
+    if top and y0 > 0:
+        fill.append(rect(nx0, 0, nx1, y0 + 1))
+    return fill
+
+
+def _to_edges(sides: Tuple[bool, bool, bool, bool], box: Box, size: Tuple[int, int]) -> Box:
+    left, top, right, bottom = sides
+    return (0.0 if left else box[0], 0.0 if top else box[1],
+            float(size[0]) if right else box[2], float(size[1]) if bottom else box[3])
+
+
+def _box_field(value, name: str) -> Optional[Box]:
+    if value is None:
+        return None
+    left, top, right, bottom = (_number(v) for v in value)
+    if right <= left or bottom <= top:
+        raise SelectionError(f"{name}는 [왼쪽, 위, 오른쪽, 아래] 형식이어야 합니다.")
+    return (left, top, right, bottom)
 
 
 # ----------------------------------------------------------------- geometry

@@ -240,9 +240,9 @@ class BatchRunner:
         try:
             placement = self._locate(photo, self.job.area)
         except textfind.TextFindUnavailable as exc:
-            return self.job.area, f"글자 찾기 못 함: {exc}"
+            return self.job.area, f"워터마크 찾기 못 함: {exc}"
         except Exception as exc:  # noqa: BLE001 - finding the text must never stop the run
-            return self.job.area, f"글자 찾기 오류: {exc!r}"
+            return self.job.area, f"워터마크 찾기 오류: {exc!r}"
         if placement.found is None:
             return self.job.area, placement.note  # as saved, exactly as without finding text
         return placement.area, placement.note

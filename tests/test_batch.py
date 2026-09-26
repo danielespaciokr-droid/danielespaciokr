@@ -386,8 +386,8 @@ class BatchRunnerTests(BatchTestCase):
         batch.BatchRunner(self.job(find_text=True), events.append, remove=remove, locate=locate).run()
         self.assertEqual([c["area"] for c in remove.calls], [AREA, AREA])
         notes = [e["result"]["textNote"] for e in events if e["type"] == "done"]
-        self.assertEqual(notes[0], "글자 찾기 못 함: numpy가 필요합니다")
-        self.assertIn("글자 찾기 오류", notes[1])
+        self.assertEqual(notes[0], "워터마크 찾기 못 함: numpy가 필요합니다")
+        self.assertIn("워터마크 찾기 오류", notes[1])
 
     def test_text_is_not_looked_for_unless_asked(self):
         self.photo("a.jpg")
