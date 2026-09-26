@@ -590,6 +590,77 @@ class AppTests(unittest.TestCase):
         self.assertFalse(settings.load_settings("batch")["find_text"])
         window.close()
 
+    def test_batch_window_picks_the_area_for_each_orientation(self):
+        landscape = shapes.Area([shapes.rect(470, 380, 800, 450)], (800, 600), "anchor")
+        portrait = shapes.Area([shapes.rect(250, 500, 600, 560)], (600, 800), "anchor")
+        settings.save_preset("워터마크 가로형", landscape)
+        settings.save_preset("워터마크 세로형", portrait)
+        settings.save_preset("로고", shapes.Area([shapes.rect(10, 10, 60, 40)], (800, 600), "anchor"))
+        # Chosen before landscape and portrait photos had a choice each: its partner comes along by itself.
+        settings.save_settings("batch", {"preset": "워터마크 가로형", "watch": False, "find_text": False})
+        self.app.open_batch_window()
+        window = self.app._batch_window
+        self.assertEqual((window.preset.get(), window.portrait_preset.get()), ("워터마크 가로형", "워터마크 세로형"))
+        self.assertIn("가로·세로를 알아서 구분해서", window.area_info.get())
+        folder = Path(self.tmp.name) / "사진"
+        folder.mkdir()
+        stamp = time.time() - 60
+        for name, size in (("wide.jpg", (800, 600)), ("tall.jpg", (600, 800))):
+            Image.new("RGB", size).save(folder / name)
+            os.utime(folder / name, (stamp, stamp))
+        window.input_dir.set(str(folder))
+
+        def fake_remove(photo, area, output, options, **kwargs):
+            output.write_bytes(b"result")
+            used = area.for_size(Image.open(photo).size)
+            return {"ok": True, "output": str(output), "warnings": [],
+                    "areaUsed": shapes.orientation_of(used.image_size)}
+
+        with mock.patch.object(gui.api, "remove_area", side_effect=fake_remove) as remove:
+            window.start()
+            for _ in range(200):
+                self.pump(0.02)
+                if not window.running:
+                    break
+        pair = shapes.AreaSet({"landscape": landscape, "portrait": portrait})
+        self.assertEqual([c.args[1] for c in remove.call_args_list], [pair, pair])
+        log = window.log.get("1.0", "end")
+        self.assertIn("가로 사진 '워터마크 가로형', 세로 사진 '워터마크 세로형'", log)
+        self.assertIn("tall_removed.jpg (세로 사진용 영역", log)
+        self.assertIn("wide_removed.jpg (가로 사진용 영역", log)
+        self.assertEqual(settings.load_settings("batch")["portrait_preset"], "워터마크 세로형")
+        # Another choice for landscape photos brings its own portrait area (here: none, so it is fitted).
+        window.preset.set("로고")
+        self.assertEqual(window.portrait_preset.get(), "로고")
+        self.assertIn("세로 사진에는 가로 사진용 영역을 맞춰서 씁니다", window.area_info.get())
+        # The portrait one chosen for landscape photos: the pair is put right.
+        window.preset.set("워터마크 세로형")
+        self.assertEqual((window.preset.get(), window.portrait_preset.get()), ("워터마크 가로형", "워터마크 세로형"))
+        # The portrait choice can be made by hand.
+        window.portrait_preset.set("로고")
+        self.assertEqual(window.preset.get(), "워터마크 가로형")
+        self.assertIn("세로 사진에는 가로 사진용 영역을 맞춰서 씁니다", window.area_info.get())
+        window.close()
+
+    def test_apply_on_a_portrait_photo_takes_the_portrait_partner(self):
+        app = self.app
+        settings.save_preset("워터마크 가로형", shapes.Area([shapes.rect(470, 380, 800, 450)], (800, 600), "anchor"))
+        settings.save_preset("워터마크 세로형", shapes.Area([shapes.rect(250, 500, 600, 560)], (600, 800), "anchor"))
+        app._refresh_presets(select="워터마크 가로형")
+        tall = Path(self.tmp.name) / "tall.jpg"
+        Image.new("RGB", (600, 800), (40, 120, 200)).save(tall)
+        app.load_photo(tall)
+        self.pump(0.1)
+        app.apply_preset()
+        self.assertEqual(shapes.bounds(app.shapes), (250, 500, 600, 560))
+        self.assertIn("'워터마크 세로형'의 세로 사진용 영역을 놓았습니다", app.status.get())
+        with mock.patch.object(gui.textfind, "place", side_effect=lambda photo, area: gui.textfind.Placement(
+                area.for_size((600, 800)), None, "상자 못 찾음", "box")) as place:
+            app.find_text_here()
+            self.wait_idle()
+        self.assertEqual(set(place.call_args.args[1].areas), {"landscape", "portrait"})
+        self.assertIn("'워터마크 세로형'", app.status.get())
+
     def test_watcher_restarts_itself_after_an_unexpected_error(self):
         self.app.open_batch_window()
         window = self.app._batch_window

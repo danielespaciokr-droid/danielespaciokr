@@ -12,7 +12,7 @@ from typing import List, Optional, Sequence
 from . import __version__, api, textfind
 from .batch import DEFAULT_OUTPUT_FOLDER, DEFAULT_WATCH_INTERVAL, BatchJob, BatchRunner
 from .photoshop import PhotoshopError, ScriptFailed
-from .settings import check_preset_name, delete_preset, list_presets, load_preset, presets_dir
+from .settings import check_preset_name, delete_preset, list_presets, load_pair, load_preset, preset_pair, presets_dir
 from .shapes import (ORIENTATION_LABELS, Area, SelectionError, area_has_shapes, ellipse, load_area_set,
                      parse_box, parse_points, polygon, rect)
 
@@ -148,7 +148,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add_area_options(parser: argparse.ArgumentParser, subject: bool = True, find_text: bool = False) -> None:
     area = parser.add_argument_group("지울 영역")
-    area.add_argument("--preset", metavar="이름", help="GUI에서 저장한 공통 영역 (ps-remover presets로 목록 보기)")
+    area.add_argument("--preset", metavar="이름", help="GUI에서 저장한 공통 영역 (ps-remover presets로 목록 보기). "
+                      "사진마다 가로·세로에 맞는 영역을 쓰고, 그 방향의 영역이 없으면 '워터마크 가로형'과 '워터마크 세로형'처럼 "
+                      "가로·세로만 다른 이름의 공통 영역에서 가져옴")
+    area.add_argument("--portrait-preset", metavar="이름", help="세로 사진에는 이 공통 영역을 쓰기")
     area.add_argument("--selection", metavar="파일.json", help="선택 영역 파일")
     area.add_argument("--rect", action="append", default=[], metavar="X,Y,W,H",
                       help="사각형: 왼쪽 위 X,Y와 너비,높이 (여러 번 쓸 수 있음)")
@@ -437,12 +440,16 @@ def _collect_area(args, required: bool = True):
     drawn = ([rect(*parse_box(text)) for text in args.rect]
              + [ellipse(*parse_box(text)) for text in args.ellipse]
              + [polygon(parse_points(text)) for text in args.polygon])
+    portrait = getattr(args, "portrait_preset", None)
+    if portrait and not args.preset:
+        raise api.JobError("--portrait-preset은 --preset(가로 사진에 쓸 공통 영역)과 함께 쓰세요.")
     if args.preset and args.selection:
         raise api.JobError("--preset과 --selection은 함께 쓸 수 없습니다.")
     if (args.preset or args.selection) and drawn:
         raise api.JobError("--preset이나 --selection에 --rect, --ellipse, --polygon을 더할 수는 없습니다.")
     if args.preset:
-        area = load_preset(args.preset)
+        landscape, paired = preset_pair(args.preset)
+        area = load_pair(landscape, portrait or paired)
     elif args.selection:
         area = load_area_set(args.selection)
     else:

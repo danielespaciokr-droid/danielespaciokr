@@ -254,7 +254,8 @@ class Area:
 
         Along the other direction, such an area keeps its place in proportion to
         the photo: Getty Images' box is centred at two thirds of the height on
-        every photo, on the right edge.
+        every photo, on the right edge. Where the box was found inside the area
+        (``band_box``), the box's middle counts, not the room drawn around it.
         """
         if self.fit != "anchor":
             return self.anchor
@@ -263,7 +264,7 @@ class Area:
         if not any(sides):
             return (ax, ay)
         width, height = self.image_size
-        x0, y0, x1, y1 = bounds(self.shapes)
+        x0, y0, x1, y1 = self.band_box or bounds(self.shapes)
         ax = 0.0 if left and not right else 1.0 if right and not left else min(1.0, max(0.0, (x0 + x1) / 2 / width))
         ay = 0.0 if top and not bottom else 1.0 if bottom and not top else min(1.0, max(0.0, (y0 + y1) / 2 / height))
         return (ax, ay)

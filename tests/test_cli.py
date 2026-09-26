@@ -221,6 +221,25 @@ class CliTests(unittest.TestCase):
         code, _, err = run(["remove", str(self.photo), "--preset", "없음"])
         self.assertEqual(code, 1)
 
+    def test_landscape_and_portrait_common_areas(self):
+        landscape = shapes.Area([shapes.rect(1190, 806, 2000, 972)], (2000, 1333), "anchor")
+        portrait = shapes.Area([shapes.rect(520, 1250, 1335, 1418)], (1335, 2000), "anchor")
+        other = shapes.Area([shapes.rect(10, 10, 50, 50)], (1335, 2000), "anchor")
+        settings.save_preset("워터마크 가로형", landscape)
+        settings.save_preset("워터마크 세로형", portrait)
+        settings.save_preset("다른 세로", other)
+        pair = shapes.AreaSet({"landscape": landscape, "portrait": portrait})
+        for extra, expected in (([], pair), (["--portrait-preset", "다른 세로"],
+                                               shapes.AreaSet({"landscape": landscape, "portrait": other}))):
+            with self.subTest(extra=extra), \
+                    mock.patch("ps_remover.api.remove_area", return_value={"ok": True, "output": "o"}) as remove:
+                code, _, err = run(["remove", str(self.photo), "--preset", "워터마크 가로형"] + extra)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(remove.call_args.args[1], expected)
+        code, _, err = run(["remove", str(self.photo), "--portrait-preset", "워터마크 세로형"])
+        self.assertEqual(code, 1)
+        self.assertIn("--preset", err)
+
     def test_batch_command(self):
         folder = self.dir / "사진"
         folder.mkdir()

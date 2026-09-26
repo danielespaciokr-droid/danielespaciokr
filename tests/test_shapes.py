@@ -209,6 +209,15 @@ class AreaTests(unittest.TestCase):
         self.assertEqual(len(middle.on_photo((1335, 2000))), 1)
         self.assertEqual(shapes.Area([shapes.rect(0, 0, 10, 10)]).glued_sides(), (False,) * 4)  # size unknown
 
+    def test_area_on_an_edge_is_placed_by_the_box_inside_it(self):
+        # Drawn with more room below the box than above it: the box's own middle keeps its place.
+        drawn = [shapes.rect(1190, 800, 2000, 1000)]
+        area = shapes.Area(drawn, (2000, 1333), "anchor", band_box=(1200, 817, 2000, 961))
+        self.assertAlmostEqual(area.placing_anchor()[1], 889 / 1333)
+        box = area.map_box(area.band_box, (1365, 2048))
+        self.assertAlmostEqual((box[1] + box[3]) / 2, 2048 * 889 / 1333, delta=0.5)
+        self.assertNotAlmostEqual(shapes.Area(drawn, (2000, 1333), "anchor").placing_anchor()[1], 889 / 1333, places=3)
+
     def test_glue_fill(self):
         fill = shapes.glue_fill((True, False, False, True), (10, 20, 50, 60), (100, 80))
         self.assertEqual([s.box for s in fill], [(0, 20, 11, 80), (0, 59, 50, 80)])  # the corner too

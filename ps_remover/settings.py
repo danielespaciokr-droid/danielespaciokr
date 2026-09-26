@@ -8,7 +8,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 from .shapes import Area, AreaSet, SelectionError, load_area_set, save_area
 
@@ -16,6 +16,8 @@ APP_NAME = "ps-remover"
 STARTUP_SCRIPT_NAME = "PS Remover 폴더 자동 처리.cmd"
 LOG_KEEP_DAYS = 30
 _BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+# Words that tell a common area's orientation apart in its name, e.g. '워터마크 가로형' / '워터마크 세로형'.
+_ORIENTATION_WORDS = re.compile(r"(가로|세로)\s*(사진)?\s*[형용]?|landscape|portrait|horizontal|vertical")
 
 
 def config_dir() -> Path:
@@ -67,6 +69,61 @@ def load_preset(name: str) -> AreaSet:
         saved = ", ".join(list_presets()) or "없음"
         raise SelectionError(f"공통 영역 '{name.strip()}'이(가) 없습니다. 저장된 공통 영역: {saved}")
     return load_area_set(path)
+
+
+def partner_preset(name: str, orientation: str) -> Optional[str]:
+    """The common area to use along with ``name`` on photos of ``orientation``.
+
+    ``name`` itself when it has an area drawn for that orientation; else one
+    that has, saved under the same name but for its orientation word:
+    '워터마크 세로형' for '워터마크 가로형', '글씨 (세로)' for '글씨 (가로)' or
+    for '글씨'. None when there is none.
+    """
+    try:
+        if orientation in load_preset(name).areas:
+            return name
+    except SelectionError:
+        return None
+    base = _base_name(name)
+    found = []
+    for other in list_presets():
+        if other.casefold() == name.casefold() or _base_name(other) != base:
+            continue
+        try:
+            if orientation in load_preset(other).areas:
+                found.append(other)
+        except SelectionError:
+            continue
+    return found[0] if len(found) == 1 else None
+
+
+def preset_pair(name: str) -> Tuple[str, str]:
+    """The common areas for landscape and for portrait photos, going with ``name`` (see partner_preset)."""
+    if not name:
+        return ("", "")
+    landscape = partner_preset(name, "landscape")
+    portrait = partner_preset(name, "portrait")
+    if landscape != name and portrait != name:  # unreadable, or drawn for neither: leave it to load_pair
+        return (name, name)
+    return (landscape or name, portrait or name)
+
+
+def load_pair(landscape: str, portrait: str) -> AreaSet:
+    """The area for landscape photos from common area ``landscape``, for portrait ones from ``portrait``.
+
+    A common area without an area for that orientation gives its other one,
+    which is then fitted to those photos.
+    """
+    first = load_preset(landscape)
+    if not portrait or portrait.casefold() == landscape.casefold():
+        return first
+    second = load_preset(portrait)
+    return AreaSet({"landscape": first.for_orientation("landscape"), "portrait": second.for_orientation("portrait")})
+
+
+def _base_name(name: str) -> str:
+    """``name`` without its orientation word, spaces and brackets: the same for both of a pair."""
+    return re.sub(r"[\W_]+", "", _ORIENTATION_WORDS.sub("", name.casefold()))
 
 
 def delete_preset(name: str) -> None:

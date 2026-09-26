@@ -56,7 +56,8 @@ ADJUST_INTRO = (
 ADJUST_HINT = "보정: 지운 다음 녹화해 둔 보정 동작을 사진 전체에 적용하고 저장합니다. 처음이면 보정 줄의 [설정...]을 보세요."
 
 ORIENTATION_HELP = ("가로 사진과 세로 사진에서 글씨 자리가 다르면, 다른 방향의 사진을 열어 그 사진에 맞게 그린 뒤 "
-                    "같은 이름으로 한 번 더 저장하세요. 사진마다 방향에 맞는 영역을 알아서 고릅니다.")
+                    "같은 이름으로 한 번 더 저장하세요. '워터마크 가로형'과 '워터마크 세로형'처럼 가로·세로만 다른 "
+                    "이름으로 따로 저장해도 됩니다. 사진마다 방향에 맞는 영역을 알아서 고릅니다.")
 
 TEXTFIND_MISSING = ("글자를 찾으려면 numpy가 필요합니다. 이 프로그램을 닫고 run_windows.bat(macOS는 run_mac.command)을 "
                     "다시 실행하면 저절로 설치됩니다.")
@@ -85,6 +86,8 @@ HELP_TEXT = """\
 여러 사진에서 같은 자리를 지우려면 (공통 영역)
   기준 사진에 지울 영역을 그리고 [지금 영역 저장...]으로 이름을 붙여 저장합니다.
   가로 사진과 세로 사진을 하나씩 열어 같은 이름으로 저장하면 둘 다 들어갑니다.
+  ('워터마크 가로형', '워터마크 세로형'처럼 가로·세로만 다른 이름으로 저장해도 짝으로 묶입니다)
+  사진마다 가로·세로를 보고 알맞은 영역을 알아서 씁니다.
   [폴더 자동 처리...]에서 사진 폴더와 공통 영역을 고르고 [시작]을 누르면
   폴더에 사진이 들어올 때마다 1초 안팎에 그 영역을 선택해 지우고 저장합니다.
   다음부터는 auto_windows.bat(macOS는 auto_mac.command)만 실행하면 바로 시작합니다.
@@ -779,7 +782,7 @@ class RemoverApp:
             messagebox.showinfo(APP_TITLE, "먼저 미리보기가 되는 사진을 여세요.")
             return
         try:
-            area_set = settings.load_preset(name)
+            area_set, used = self._common_area(name)
             orientation = sh.orientation_of(self.image_size)
             area = area_set.for_orientation(orientation)
             self.shapes = area.on_photo(self.image_size)
@@ -788,12 +791,20 @@ class RemoverApp:
             return
         self._schedule_render()
         label = sh.ORIENTATION_LABELS[orientation]
-        if orientation in area_set.areas:
-            self.status.set(f"공통 영역 '{name}'의 {label}용 영역을 놓았습니다.")
+        drawn_for = sh.orientation_of(area.image_size) if area.image_size else orientation
+        if drawn_for == orientation:
+            self.status.set(f"공통 영역 '{used}'의 {label}용 영역을 놓았습니다.")
         else:
-            other = sh.ORIENTATION_LABELS[next(iter(area_set.areas))]
-            self.status.set(f"공통 영역 '{name}'에 {label}용 영역이 없어서 {other}용 영역을 맞춰 놓았습니다 "
-                            f"({area.describe()}). 위치가 다르면 여기서 다시 그리고 같은 이름으로 저장하세요.")
+            other = sh.ORIENTATION_LABELS[drawn_for]
+            self.status.set(f"공통 영역 '{used}'에 {label}용 영역이 없어서 {other}용 영역을 맞춰 놓았습니다 "
+                            f"({area.describe()}). 위치가 다르면 여기서 다시 그리고 저장하세요.")
+
+    def _common_area(self, name: str) -> Tuple[sh.AreaSet, str]:
+        """The common area ``name`` with its partner for the other orientation (see settings.preset_pair),
+        and the name of the one whose area this photo gets."""
+        landscape, portrait = settings.preset_pair(name)
+        used = portrait if sh.orientation_of(self.image_size) == "portrait" else landscape
+        return settings.load_pair(landscape, portrait), used
 
     def find_text_here(self) -> None:
         """Put the area on the credit (box or text) found in this photo, the way the folder watcher does."""
@@ -807,13 +818,13 @@ class RemoverApp:
             return
         name = self.preset.get()
         try:
-            area = settings.load_preset(name) if name else None
+            area, used = self._common_area(name) if name else (None, "")
         except sh.SelectionError as exc:
             messagebox.showerror(APP_TITLE, str(exc))
             return
         photo = self.photo_path
         self._start("사진에서 워터마크를 찾는 중입니다...", lambda: {"placement": textfind.place(photo, area)},
-                    lambda result: self._text_found(result["placement"], name))
+                    lambda result: self._text_found(result["placement"], used))
 
     def _text_found(self, placement: "textfind.Placement", name: str) -> None:
         found = placement.found
@@ -1108,7 +1119,14 @@ class BatchWindow:
         self.window.title(self.TITLE)
         self.window.minsize(700, 560)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
-        self.preset = tk.StringVar(value=saved.get("preset") or (app.preset.get() if app else ""))
+        # The common area for landscape (and square) photos, and the one for portrait photos: each photo
+        # gets the one for its orientation.
+        landscape = saved.get("preset") or (app.preset.get() if app else "")
+        portrait = saved.get("portrait_preset")
+        if portrait is None:  # saved before portrait photos had a choice of their own
+            landscape, portrait = settings.preset_pair(landscape)
+        self.preset = tk.StringVar(value=landscape)
+        self.portrait_preset = tk.StringVar(value=portrait)
         self.input_dir = tk.StringVar(value=saved.get("input_dir", ""))
         self.output_dir = tk.StringVar(value=saved.get("output_dir", ""))
         method = saved.get("method") or (app.method.get() if app else main.get("method"))
@@ -1139,7 +1157,8 @@ class BatchWindow:
         self._build()
         self._show_area_info()
         self._show_adjust_info()
-        self.preset.trace_add("write", lambda *_: self._show_area_info())
+        self.preset.trace_add("write", lambda *_: self._landscape_chosen())
+        self.portrait_preset.trace_add("write", lambda *_: self._show_area_info())
         # Someone is choosing a folder: stop trying the old one by itself.
         self.input_dir.trace_add("write", lambda *_: self._cancel_restart())
         # Changes made in the main window meanwhile show up here too.
@@ -1151,13 +1170,20 @@ class BatchWindow:
         body.columnconfigure(1, weight=1)
         body.rowconfigure(8, weight=1)
 
-        ttk.Label(body, text="공통 영역").grid(row=0, column=0, sticky="w")
-        area_row = ttk.Frame(body)
-        area_row.grid(row=0, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        ttk.Label(body, text="공통 영역").grid(row=0, column=0, sticky="nw", pady=(3, 0))
+        area_frame = ttk.Frame(body)
+        area_frame.grid(row=0, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        area_row = ttk.Frame(area_frame)
+        area_row.pack(anchor="w")
+        ttk.Label(area_row, text="가로 사진").pack(side=tk.LEFT)
         self.preset_box = ttk.Combobox(area_row, textvariable=self.preset, values=settings.list_presets(),
-                                       state="readonly", width=24)
-        self.preset_box.pack(side=tk.LEFT)
-        ttk.Label(area_row, textvariable=self.area_info, foreground="#666666").pack(side=tk.LEFT, padx=(10, 0))
+                                       state="readonly", width=20)
+        self.preset_box.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(area_row, text="세로 사진").pack(side=tk.LEFT, padx=(14, 0))
+        self.portrait_box = ttk.Combobox(area_row, textvariable=self.portrait_preset, values=settings.list_presets(),
+                                         state="readonly", width=20)
+        self.portrait_box.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(area_frame, textvariable=self.area_info, foreground="#666666").pack(anchor="w", pady=(2, 0))
         ttk.Label(body, text="사진 폴더").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(body, textvariable=self.input_dir).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
         ttk.Button(body, text="찾아보기...", command=lambda: self._choose_dir(self.input_dir)).grid(
@@ -1227,22 +1253,40 @@ class BatchWindow:
         ttk.Label(body, textvariable=self.status, wraplength=640, justify="left").grid(
             row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+    def _landscape_chosen(self) -> None:
+        """A common area chosen for landscape photos brings its portrait partner (see settings.preset_pair);
+        a portrait one chosen there brings its landscape partner instead of it."""
+        landscape, portrait = settings.preset_pair(self.preset.get())
+        if portrait != self.portrait_preset.get():
+            self.portrait_preset.set(portrait)
+        if landscape != self.preset.get():
+            self.preset.set(landscape)  # comes back here
+            return
+        self._show_area_info()
+
+    def _area_set(self) -> sh.AreaSet:
+        """The area for each orientation, from the common areas chosen for it."""
+        landscape = self.preset.get()
+        return settings.load_pair(landscape, self.portrait_preset.get() or landscape)
+
     def _show_area_info(self) -> None:
-        name = self.preset.get()
-        if not name:
+        if not self.preset.get():
             self.area_info.set("메인 창에서 영역을 그리고 [지금 영역 저장...]으로 만드세요." if not settings.list_presets() else "")
             return
         try:
-            areas = settings.load_preset(name).areas
+            areas = self._area_set().areas
         except sh.SelectionError:
             self.area_info.set("읽을 수 없는 공통 영역입니다.")
             return
-        if len(areas) == 2:
-            info = "가로·세로 사진용 영역이 따로 있습니다."
+        # A photo whose orientation has no area drawn for it gets the other one, fitted to it.
+        fitted = [o for o in sh.ORIENTATIONS
+                  if o not in areas or (areas[o].image_size and sh.orientation_of(areas[o].image_size) != o)]
+        if not fitted:
+            info = "사진마다 가로·세로를 알아서 구분해서 알맞은 영역을 씁니다."
         else:
-            this = next(iter(areas))
-            other = "세로" if this == "landscape" else "가로"
-            info = f"{sh.ORIENTATION_LABELS[this]}용 영역만 있습니다 ({other} 사진에는 맞춰서 씁니다)."
+            label = sh.ORIENTATION_LABELS[fitted[0]]
+            other = "세로" if fitted[0] == "landscape" else "가로"
+            info = f"{label}에는 {other} 사진용 영역을 맞춰서 씁니다. {label}용 영역이 따로 있으면 고르세요."
         if any(area.band_box for area in areas.values()):
             info += " 상자 위치 기억함."
         elif any(area.text_box for area in areas.values()):
@@ -1264,7 +1308,10 @@ class BatchWindow:
         self.adjust_info.set(f"Photoshop 동작 '{action_set} > {action_name}'")
 
     def _refresh_from_main(self) -> None:
-        self.preset_box.configure(values=settings.list_presets())
+        names = settings.list_presets()
+        self.preset_box.configure(values=names)
+        self.portrait_box.configure(values=names)
+        self._show_area_info()
         self._show_adjust_info()
 
     def _choose_dir(self, variable: tk.StringVar) -> None:
@@ -1299,6 +1346,12 @@ class BatchWindow:
             adjust_name=adjust_name,
         )
 
+    def _area_names(self) -> str:
+        landscape, portrait = self.preset.get(), self.portrait_preset.get()
+        if not portrait or portrait == landscape:
+            return f"'{landscape}'"
+        return f"가로 사진 '{landscape}', 세로 사진 '{portrait}'"
+
     @property
     def running(self) -> bool:
         return self._runner is not None
@@ -1319,7 +1372,7 @@ class BatchWindow:
                 interval = max(0.5, float(self.interval.get()))
                 options = self._options()
                 output = self.output_dir.get().strip()
-                job = BatchJob(Path(self.input_dir.get().strip()), settings.load_preset(self.preset.get()),
+                job = BatchJob(Path(self.input_dir.get().strip()), self._area_set(),
                                Path(output) if output else None, options, skip_done=self.skip_done.get(),
                                find_text=self.find_text.get())
             except (ValueError, sh.SelectionError) as exc:  # JobError is a ValueError
@@ -1337,7 +1390,7 @@ class BatchWindow:
         mode = "새 사진이 들어오면 바로 처리" if watch else "지금 있는 사진만 처리"
         steps = "지우기 + 보정" if options.adjust else "지우기"
         where = ", 워터마크 찾아 맞춤" if job.find_text else ""
-        self._log(f"시작: {job.input_dir} → {job.output_dir} ('{self.preset.get()}'{where}, {mode}, {steps})")
+        self._log(f"시작: {job.input_dir} → {job.output_dir} ({self._area_names()}{where}, {mode}, {steps})")
         if job.find_text and not textfind.available():
             self._log("참고: " + TEXTFIND_MISSING + " 그전까지는 저장된 위치를 지웁니다.")
         if watch and self._awake.start():
@@ -1479,7 +1532,8 @@ class BatchWindow:
     def _save_settings(self) -> None:
         try:
             settings.save_settings("batch", {
-                "preset": self.preset.get(), "input_dir": self.input_dir.get().strip(),
+                "preset": self.preset.get(), "portrait_preset": self.portrait_preset.get(),
+                "input_dir": self.input_dir.get().strip(),
                 "output_dir": self.output_dir.get().strip(), "method": self.method.get(),
                 "expand": self.expand.get(), "adjust": self.adjust.get(), "find_text": self.find_text.get(),
                 "skip_done": self.skip_done.get(),

@@ -47,6 +47,42 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(SelectionError, "logo"):  # names the presets that do exist
             settings.load_preset("워터마크")
 
+    def test_landscape_and_portrait_common_areas_go_together(self):
+        landscape = shapes.Area([shapes.rect(1190, 806, 2000, 972)], (2000, 1333), "anchor")
+        portrait = shapes.Area([shapes.rect(520, 1250, 1335, 1418)], (1335, 2000), "anchor")
+        settings.save_preset("워터마크 가로형", landscape)
+        settings.save_preset("워터마크 세로형", portrait)
+        settings.save_preset("로고", AREA)  # another common area, left alone
+        # Saved under names that differ only in the orientation word, they make one pair.
+        self.assertEqual(settings.partner_preset("워터마크 가로형", "portrait"), "워터마크 세로형")
+        self.assertEqual(settings.partner_preset("워터마크 가로형", "landscape"), "워터마크 가로형")
+        self.assertEqual(settings.preset_pair("워터마크 가로형"), ("워터마크 가로형", "워터마크 세로형"))
+        self.assertEqual(settings.preset_pair("워터마크 세로형"), ("워터마크 가로형", "워터마크 세로형"))
+        both = settings.load_pair("워터마크 가로형", "워터마크 세로형")
+        self.assertEqual(both, shapes.AreaSet({"landscape": landscape, "portrait": portrait}))
+        self.assertEqual(both.for_size((1365, 2048)), portrait)  # each photo gets its orientation's area
+        self.assertEqual(both.for_size((2048, 1365)), landscape)
+        # Without a partner a common area goes with itself (its area is fitted to the other photos).
+        self.assertEqual(settings.preset_pair("로고"), ("로고", "로고"))
+        self.assertEqual(settings.load_pair("로고", "로고"), shapes.AreaSet.single(AREA))
+        self.assertEqual(settings.preset_pair(""), ("", ""))
+        self.assertEqual(settings.preset_pair("없는 이름"), ("없는 이름", "없는 이름"))
+        # One common area with both orientations goes with itself.
+        settings.save_preset("글씨", shapes.AreaSet({"landscape": landscape, "portrait": portrait}))
+        settings.save_preset("글씨 세로", portrait)
+        self.assertEqual(settings.preset_pair("글씨"), ("글씨", "글씨"))
+        # Other ways of naming the pair.
+        for first, second in (("글자 (가로)", "글자 (세로)"), ("logo landscape", "logo_portrait"), ("가로 사진용 A", "세로 사진용 A")):
+            with self.subTest(first=first):
+                settings.save_preset(first, landscape)
+                settings.save_preset(second, portrait)
+                self.assertEqual(settings.preset_pair(first), (first, second))
+        # Two candidates: neither is taken.
+        settings.save_preset("표시 가로", landscape)
+        settings.save_preset("표시 세로", portrait)
+        settings.save_preset("표시 세로형", portrait)
+        self.assertEqual(settings.preset_pair("표시 가로"), ("표시 가로", "표시 가로"))
+
     def test_bad_names(self):
         for name in ("", "   ", "a/b", "a\\b", "what?", ".hidden", "x" * 61):
             with self.subTest(name=name), self.assertRaises(SelectionError):
